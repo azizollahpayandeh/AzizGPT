@@ -1,0 +1,9 @@
+line-length = 100
+target-version = "py311"
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",  # long lines are mostly prose in docstrings
+    "B008",  # config defaults are read at call time on purpose
+]

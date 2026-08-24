@@ -1,0 +1,26 @@
+# Core — required
+openai==3.3.1               # OpenAI-compatible client, pointed at Groq
+python-dotenv==1.2.3        # loads .env
+PyYAML==6.0.3               # config.yaml
+requests==2.34.2            # Open-Meteo weather lookups
+
+# Audio capture and wake word — required for --listen and --wake
+sounddevice==0.5.6          # needs libportaudio2 (apt install portaudio19-dev)
+webrtcvad==2.0.10           # voice activity detection
+setuptools<81               # webrtcvad still imports pkg_resources
+openwakeword==0.4.0         # wake word models (hey_jarvis ships with it)
+onnxruntime==1.29.0
+numpy==2.5.2
+
+# Local text-to-speech fallback — required for offline speech
+piper-tts==1.7.0            # voice model downloaded separately, see README
+
+# ---------------------------------------------------------------- optional --
+# Local speech-to-text fallback. Adds ~500 MB of RAM while transcribing.
+#   pip install faster-whisper
+#
+# Noise suppression for the wake word detector.
+#   pip install speexdsp-ns
+#
+# Only if you must reach the API through a SOCKS proxy.
+#   pip install socksio

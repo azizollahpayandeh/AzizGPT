@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # sounddevice needs the portaudio shared library present to import.
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y portaudio19-dev
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff
+
+      - name: Lint
+        run: ruff check azizgpt scripts
+
+      - name: Byte-compile everything
+        run: python -m compileall -q azizgpt scripts
+
+      # No API key is available here and none is needed: this only proves the
+      # modules import cleanly on a machine with no audio device and no .env.
+      - name: Import check
+        run: |
+          python - <<'PY'
+          import importlib
+          modules = [
+              "azizgpt.config", "azizgpt.brain", "azizgpt.gate",
+              "azizgpt.recorder", "azizgpt.stt", "azizgpt.tts",
+              "azizgpt.wakeword", "azizgpt.single_instance",
+              "azizgpt.memprofile", "azizgpt.main",
+              "azizgpt.tools", "azizgpt.tools.apps", "azizgpt.tools.web",
+              "azizgpt.tools.system", "azizgpt.tools.alarms",
+              "azizgpt.tools.power",
+          ]
+          for name in modules:
+              importlib.import_module(name)
+              print(f"ok  {name}")
+          PY
+
+      - name: Config parses and the tool registry builds
+        run: |
+          python - <<'PY'
+          import os
+          os.environ.setdefault("GROQ_API_KEY", "placeholder-not-a-real-key")
+          from azizgpt.config import load_config
+          from azizgpt import tools
+          cfg = load_config()
+          names = [t["function"]["name"] for t in tools.build_schemas(cfg)]
+          print("tools:", names)
+          assert "power_action" in names
+          assert cfg.app_argv("chrome"), "allowlist missing chrome"
+          assert cfg.app_argv("spotify") is None, "allowlist is not closed"
+          print("allowlist is closed, registry builds")
+          PY
+
+      - name: Scorer self-test (no API calls)
+        run: python scripts/test_tools.py --self-test

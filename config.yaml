@@ -1,0 +1,128 @@
+# AzizGPT configuration.
+# Model names live here, never in the code. Free-tier catalogs rotate; run
+#   python -m azizgpt.main --check-providers
+# to see which of these are actually reachable with your key.
+
+# ---------------------------------------------------------------- providers --
+# Ordered chain. First enabled provider that is not marked dead wins.
+providers:
+  - name: groq
+    base_url: https://api.groq.com/openai/v1
+    api_key_env: GROQ_API_KEY
+    model: openai/gpt-oss-20b        # or openai/gpt-oss-120b
+    enabled: true
+
+  # Template. Add OPENROUTER_API_KEY to .env and flip enabled to true.
+  - name: openrouter
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    model: openai/gpt-oss-20b
+    enabled: false
+
+llm:
+  stream: true                 # speak the first sentence before the rest arrives
+  temperature: 0.2
+  max_tokens: 700
+  request_timeout: 45          # seconds
+  max_tool_iterations: 4       # guard against tool-call ping-pong
+  history_turns: 6             # rolling conversation memory, user+assistant pairs
+  rate_limit_retries: 3        # per-minute 429 retries before moving on
+  max_retry_sleep: 60          # cap on honouring retry-after, seconds
+
+# Not used until phase 3/4. Listed here so nothing is hardcoded later.
+stt:
+  provider: groq
+  model: whisper-large-v3-turbo
+  language: en
+  min_transcript_chars: 2            # shorter than this is echo or silence
+  local_fallback_model: base.en      # faster-whisper, optional extra install
+
+tts:
+  provider: groq
+  model: canopylabs/orpheus-v1-english
+  voice: daniel                      # autumn diana hannah austin daniel troy
+  response_format: wav
+  stream_sentences: false            # true speaks each sentence as it streams,
+                                     # at one synthesis call per sentence
+  beep_mute_tail: 0.3                # a short tone drains fast; a spoken answer
+                                     # uses wakeword.post_playback_mute instead
+  max_chars: 1200                    # long answers are trimmed before speaking
+  request_timeout: 30
+  max_retry_sleep: 5                 # a voice turn cannot wait out a long 429
+
+  # Tier 2: local piper. Speaks when Orpheus is rate limited or unreachable.
+  piper:
+    model: ~/.local/share/piper/en_US-lessac-medium.onnx
+    config: ""                       # defaults to <model>.json beside the model
+    binary: ""                       # defaults to piper beside the venv python
+    length_scale: 1.0                # >1 slower, <1 faster
+
+wakeword:
+  model: hey_jarvis                  # swap in azizbot.onnx later, no code change
+  model_dir: models                  # where a custom .onnx is looked for
+  threshold: 0.7                     # raised from 0.5: it was firing at 0.54
+  vad_threshold: 0.5                 # openwakeword's built-in Silero VAD
+  enable_speex_noise_suppression: false   # needs: pip install speexdsp-ns
+  cooldown_s: 2.0                    # ignore repeat hits just after a trigger
+  disable_onnx_arena: true           # saves ~120 MB; measured identical scores
+  skip_trainer_import: true          # keeps scipy and sklearn out (~78 MB)
+  mute_during_playback: true         # do not let its own voice re-trigger it
+  post_playback_mute: 1.0            # MEASURED with scripts/calibrate_echo.py in
+                                     # a quiet room: this Bluetooth sink drains
+                                     # 0.00s past player exit over 4 consecutive
+                                     # trials, so this is margin for jitter, not
+                                     # a real tail. Re-run that script if the
+                                     # output device changes.
+
+# ------------------------------------------------------------------- tools --
+# open_app allowlist. Friendly key -> exact argv list. Never a shell string.
+# Anything not in this map is refused.
+apps:
+  chrome:   [google-chrome]
+  firefox:  [firefox]
+  vm:       [virt-manager]
+  terminal: [gnome-terminal]
+  files:    [nautilus]
+
+weather:
+  default_city: Mashhad
+  units: metric
+
+web:
+  # Which allowlisted app opens links. Must be a key from `apps` above.
+  # Python's webbrowser module is not used: it reports success it cannot
+  # verify, and finds no browser at all when DISPLAY is not in the environment.
+  default_browser: chrome
+  launch_confirm_s: 0.4              # how long to wait before checking it lived
+
+email:
+  url: https://mail.google.com/
+
+power:
+  enabled: true                # set false to remove the tool entirely
+  confirm_timeout_s: 8         # one listen, no re-asking
+  countdown_s: 5               # Ctrl-C in the terminal aborts during this
+
+alarms:
+  max_days_ahead: 365
+  notify_title: AzizGPT alarm
+  sound_candidates:
+    - /usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga
+    - /usr/share/sounds/freedesktop/stereo/complete.oga
+    - /usr/share/sounds/sound-icons/prompt.wav
+
+state:
+  dir: ~/.local/state/azizgpt
+
+recorder:
+  sample_rate: 16000
+  frame_ms: 30                 # webrtcvad accepts 10, 20 or 30
+  vad_aggressiveness: 2        # 0 lenient .. 3 strict
+  silence_ms: 900              # stop after this much quiet once you have spoken
+  min_speech_ms: 300           # ignore a cough or a door
+  start_timeout_s: 6           # give up if nobody speaks
+  max_seconds: 20              # hard cap on one clip
+  pre_roll_ms: 300             # keep audio from just before speech started
+  speech_over_floor: 3.0       # speech must be this much louder than the room
+  min_floor_margin: 50.0       # ...and at least this far above it in absolute
+                               # terms, so a silent room cannot pass

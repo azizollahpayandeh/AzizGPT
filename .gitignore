@@ -1,0 +1,45 @@
+# Secrets — never commit
+.env
+*.env
+!.env.example
+
+# Virtualenv
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Wake word models (large binaries; bundled ones ship with openwakeword)
+models/*.onnx
+models/*.onnx.json
+*.tflite
+
+# Piper voices (60 MB+ each, downloaded separately)
+*.onnx
+*.onnx.json
+
+# Audio scratch
+*.wav
+*.ogg
+*.mp3
+*.flac
+
+# Runtime state (provider dead-until marks, alarms, beeps, instance lock)
+state/
+providers.json
+alarms.json
+*.lock
+
+# Local development log, contains machine-specific notes
+PROGRESS.md
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

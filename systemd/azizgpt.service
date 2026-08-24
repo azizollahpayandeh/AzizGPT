@@ -1,0 +1,42 @@
+# AzizGPT as a systemd user service.
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp systemd/azizgpt.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now azizgpt.service
+#
+# %h expands to your home directory, so this works unmodified if the project
+# lives at ~/AzizGPT. Change WorkingDirectory and ExecStart otherwise.
+
+[Unit]
+Description=AzizGPT voice assistant
+After=graphical-session.target sound.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/AzizGPT
+ExecStart=%h/AzizGPT/.venv/bin/python -m azizgpt.main --wake
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+Environment=PYTHONUNBUFFERED=1
+
+# If your machine reaches the API through a local HTTP proxy, uncomment and
+# adjust. Do not set ALL_PROXY to a "socks://" URL: that scheme is rejected by
+# the HTTP layer. Use "socks5://" (needs `pip install socksio`) or an http:// proxy.
+#Environment=HTTP_PROXY=http://127.0.0.1:8080/
+#Environment=HTTPS_PROXY=http://127.0.0.1:8080/
+#Environment=NO_PROXY=localhost,127.0.0.0/8,::1
+
+# Idle sits near 145 MB. These are backstops for the transient spike when piper
+# synthesises (~240 MB in its own process, accounted to this unit), not targets.
+# Check with: python -m azizgpt.main --mem
+MemoryHigh=600M
+MemoryMax=800M
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
