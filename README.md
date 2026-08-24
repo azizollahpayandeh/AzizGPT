@@ -2,7 +2,7 @@
 
 A background voice assistant for Linux that runs entirely on hosted inference, with a security model designed around the assumption that the speech recogniser will occasionally hear things that were never said.
 
-It listens for a wake word, records until you stop talking, transcribes, decides whether the request maps to a tool, runs it, and answers out loud. Speech-to-text, the language model, and text-to-speech all go through Groq's OpenAI-compatible API on a single key. There is no local language model. Idle memory is about 145 MB, which matters because the machine it was built for has 8 GB and usually a VM running.
+It listens for a wake word, records until you stop talking, transcribes, decides whether the request maps to a tool, runs it, and answers out loud — then keeps listening, so a follow-up continues the same conversation without saying the wake word again. Speech-to-text, the language model, and text-to-speech all go through Groq's OpenAI-compatible API on a single key. There is no local language model. Idle memory is about 145 MB, which matters because the machine it was built for has 8 GB and usually a VM running.
 
 The interesting part is not that it works, it is what happens when it mishears. Whisper hallucinates fluent sentences out of room noise. A voice assistant that can launch programs and power off a machine has to be built expecting that, so the model is confined to a fixed set of enumerated tools with validated arguments, never a shell, and anything destructive requires a spoken confirmation whose accepted words are chosen specifically to exclude what Whisper invents from silence.
 
@@ -78,6 +78,35 @@ python -m azizgpt.main --text --dry-run --verbose
 ```
 
 ---
+
+## Conversation sessions
+
+A wake word opens a session, not a single exchange. After it answers, it listens
+for `session.follow_up_timeout_s` seconds (5 by default); anything you say in
+that window continues the **same** conversation, so the model has the earlier
+turns and "and what about tomorrow" resolves. Silence closes the session and it
+returns to waiting for the wake word.
+
+```
+"hey jarvis"  ──▶ [beep, session open]
+                    "what is the weather in Messina"   ──▶ answer
+                    (5s window, starts after playback ends)
+                    "and what about London"            ──▶ answer, same context
+                    (5s window)
+                    silence                            ──▶ [low beep, session closed]
+              ◀──  waiting for the wake word again
+```
+
+The window opens only once playback has actually finished, not when the answer
+was generated — otherwise the microphone reopens while the speakers are still
+going and the assistant hears itself. The playback gate applies throughout.
+
+History belongs to the session and is dropped when it closes, so a new wake word
+always starts clean. Sessions are capped by `session.max_turns` and
+`session.max_duration_s` so one cannot stay open indefinitely, and the rolling
+`llm.history_turns` bounds the context within a session. Neither an empty
+transcription nor a Whisper hallucination counts as speech, so neither keeps a
+session alive. Session open, each turn, and close-with-reason are logged.
 
 ## Architecture
 
@@ -250,6 +279,9 @@ Everything tunable lives in `config.yaml`. Model names are never hardcoded, beca
 | `llm.history_turns` | `6` | Rolling conversation memory |
 | `stt.model` | `whisper-large-v3-turbo` | Speech to text |
 | `stt.min_transcript_chars` | `2` | Below this is treated as silence |
+| `session.follow_up_timeout_s` | `5` | Quiet for this long after it speaks closes the session |
+| `session.max_turns` | `12` | Hard cap on exchanges in one session |
+| `session.max_duration_s` | `180` | Hard cap on how long a session stays open |
 | `tts.model` | `canopylabs/orpheus-v1-english` | Voices: autumn, diana, hannah, austin, daniel, troy |
 | `tts.voice` | `daniel` | |
 | `tts.stream_sentences` | `false` | One synthesis call per answer when off |
@@ -282,7 +314,7 @@ This is the part of the project worth reviewing. The threat model is not a malic
 
 **Browser launching does not trust the environment.** Python's `webbrowser` module decides what browsers exist from `DISPLAY` and `PATH`, returns False in environments that have neither, and reports success it cannot verify. It was replaced with a direct launch through the same allowlist, with the process polled to confirm it survived.
 
-**Destructive actions require spoken confirmation, and the accepted words are the point.** `power_action` asks out loud, listens once for up to 8 seconds, and proceeds only on a clear affirmative. The accepted set is `yes`, `yes please`, `yeah`, `yep`, `yup`, `confirm`, `confirmed`, `do it`, `go ahead`, `affirmative`. It deliberately excludes **"ok", "okay" and "sure"** — all three are things Whisper invents out of silence, observed in this project. Anything not in the set cancels, including a timeout, a misheard reply, and silence. It never asks twice. After confirming there is a five second countdown, logged once a second, so Ctrl-C still aborts.
+**Destructive actions require spoken confirmation, and how consent is judged is the point.** `power_action` asks out loud, listens once for up to 8 seconds, and proceeds only on consent. Consent is judged by words rather than by an exact string: a reply counts when every word is a yes or a harmless filler and at least one is a core yes, so `yes`, `Yes Yes`, `yes please`, `yes do it`, `do it` and `go ahead` all confirm. That matters in both directions — an exact-match set rejected a real "Yes Yes" in live use, and a gate that ignores a plain yes trains you to repeat yourself at something that can power itself off. **"ok", "okay" and "sure" stay excluded**, because Whisper invents all three out of silence, observed in this project. Any negation anywhere cancels, as does a yes attached to a different request (`yes open chrome`), a timeout, a misheard reply, and silence. It never asks twice. After confirming there is a five second countdown, logged once a second, so Ctrl-C still aborts.
 
 **Confirmation cannot be bypassed by the absence of a voice.** If no speaking and listening pair is wired in — `--text` mode, the test harness — the tool refuses anything needing confirmation rather than assuming consent.
 

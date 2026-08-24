@@ -47,6 +47,14 @@ PLAYERS = (
 )
 
 # Spoken text should be plain. Strip anything that would be read out literally.
+# kind -> (hz, milliseconds, volume). The session cues are deliberately quieter
+# and lower than the wake beep: they mark state, they are not the point.
+TONES = {
+    "ready": (880.0, 120, 0.35),          # wake word heard, session open
+    "session_close": (440.0, 90, 0.18),   # back to idle, wake word needed again
+    "error": (330.0, 260, 0.35),
+}
+
 MARKDOWN = re.compile(r"[*_`#>|~]+")
 WHITESPACE = re.compile(r"\s+")
 
@@ -435,11 +443,11 @@ class Speaker:
                 self.remote_label, until.strftime("%Y-%m-%d %H:%M"),
             )
 
-        for kind, freq, ms in (("ready", 880.0, 120), ("error", 330.0, 260)):
+        for kind, (freq, ms, volume) in TONES.items():
             path = self._tone_path(kind)
             if not path.is_file():
                 try:
-                    write_tone(path, freq, ms)
+                    write_tone(path, freq, ms, volume)
                 except OSError as exc:
                     log.warning("could not write the %s beep: %s", kind, exc.__class__.__name__)
 
@@ -447,9 +455,9 @@ class Speaker:
         """Short tone. 'ready' when listening starts, 'error' when speech fails."""
         path = self._tone_path(kind)
         if not path.is_file():
-            freq, ms = (880.0, 120) if kind == "ready" else (330.0, 260)
+            freq, ms, volume = TONES.get(kind, TONES["ready"])
             try:
-                write_tone(path, freq, ms)
+                write_tone(path, freq, ms, volume)
             except OSError as exc:
                 log.warning("could not write the %s beep: %s", kind, exc.__class__.__name__)
                 return False

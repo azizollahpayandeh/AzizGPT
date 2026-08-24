@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 import time
 from collections.abc import Callable
@@ -33,11 +34,34 @@ NEEDS_CONFIRMATION = ("shutdown", "restart")
 CONFIRM_TIMEOUT_S = 8.0
 COUNTDOWN_S = 5
 
-# Deliberately tight. "ok", "okay" and "sure" are all things Whisper invents
-# out of silence, so they do not count as consent.
-AFFIRMATIVE = {
-    "yes", "yes please", "yeah", "yep", "yup",
-    "confirm", "confirmed", "do it", "go ahead", "affirmative",
+# Deliberately tight. "ok", "okay" and "sure" are all things Whisper invents out
+# of silence, so they never count as consent.
+#
+# But real speech is not a single clean token either: a person saying yes into a
+# microphone gets transcribed as "Yes Yes", "Yes, yes.", "yes please" or
+# "yes do it". Requiring an exact match rejected a genuine confirmation in
+# practice, which is its own kind of failure - it teaches you the gate is broken
+# and trains you to repeat yourself at a machine that can power itself off.
+#
+# So: a reply is consent when every word is one of these, and at least one of
+# them is a core yes. Anything else, including any negation anywhere in the
+# reply, cancels.
+CORE_AFFIRMATIVE = {
+    "yes", "yeah", "yep", "yup", "affirmative", "confirm", "confirmed",
+}
+
+# Words allowed to accompany a yes without changing its meaning.
+AFFIRMATIVE_FILLER = {
+    "please", "do", "it", "go", "ahead", "now", "sir", "then", "sure", "of", "course",
+}
+
+# Complete phrases that mean yes without containing a core word.
+AFFIRMATIVE_PHRASES = {"do it", "go ahead"}
+
+# Any of these anywhere in the reply cancels, even alongside a yes.
+NEGATIONS = {
+    "no", "nope", "not", "dont", "don", "never", "cancel", "stop", "wait",
+    "abort", "nevermind", "mind",
 }
 
 # Injected by main.py once the voice stack exists. Without it, nothing that
@@ -86,11 +110,27 @@ def _result(ok: bool, **fields: Any) -> str:
 
 
 def is_affirmative(heard: str | None) -> bool:
-    """Only a clear yes counts. Everything else is a no."""
+    """Only a clear yes counts. Everything else, including silence, is a no."""
     if not heard:
         return False
-    cleaned = " ".join(str(heard).lower().strip().strip(".,!?;:").split())
-    return cleaned in AFFIRMATIVE
+
+    words = [w for w in re.split(r"[^a-z']+", str(heard).lower()) if w]
+    words = [w.replace("'", "") for w in words]
+    if not words:
+        return False
+
+    if any(word in NEGATIONS for word in words):
+        return False
+
+    if " ".join(words) in AFFIRMATIVE_PHRASES:
+        return True
+
+    if not any(word in CORE_AFFIRMATIVE for word in words):
+        return False
+
+    # Every remaining word must be harmless. "yes open chrome instead" is not
+    # consent to shut down.
+    return all(word in CORE_AFFIRMATIVE or word in AFFIRMATIVE_FILLER for word in words)
 
 
 def power_action(cfg, action: str = "", dry_run: bool = False) -> str:

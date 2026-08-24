@@ -12,13 +12,20 @@ providers:
     model: openai/gpt-oss-20b        # or openai/gpt-oss-120b
     enabled: true
 
-  # Second tier. Verified free and tool-calling capable: the model declares
-  # "tools" in supported_parameters on /models, and was checked against this
-  # project's real schemas (open_app, get_weather, and a no-tool question).
+  # Second tier. Free-tier model slugs rotate: the previously verified
+  # nemotron-3-nano-30b-a3b:free went paid-only and now returns 404. The router
+  # treats that as "model not found", says so in plain language, and moves on,
+  # so a stale slug costs one request rather than the fallback.
+  #
+  # UNVERIFIED: this replacement is listed as free with "tools" in
+  # supported_parameters, but the key's free daily allowance was spent before it
+  # could be exercised against the real schemas. Verify with:
+  #   python -m azizgpt.main --check-providers
+  #   python scripts/test_tools.py --config <openrouter-only config>
   - name: openrouter
     base_url: https://openrouter.ai/api/v1
     api_key_env: OPENROUTER_API_KEY
-    model: nvidia/nemotron-3-nano-30b-a3b:free
+    model: nvidia/nemotron-3.5-lightning:free
     enabled: true
 
 llm:
@@ -120,6 +127,14 @@ alarms:
 
 state:
   dir: ~/.local/state/azizgpt
+
+# A wake word opens a session rather than a single exchange: after it answers,
+# it keeps listening for a follow-up, and the model sees the earlier turns so
+# "and what about tomorrow" resolves. Silence closes the session.
+session:
+  follow_up_timeout_s: 5       # quiet for this long after it speaks -> close
+  max_turns: 12                # hard cap on exchanges in one session
+  max_duration_s: 180          # hard cap on how long a session may stay open
 
 recorder:
   sample_rate: 16000

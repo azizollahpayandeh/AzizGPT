@@ -339,6 +339,75 @@ def handle_turn(
         )
 
 
+def run_session(
+    brain: Brain,
+    speaker: Speaker,
+    recorder: Recorder,
+    transcriber: Transcriber,
+) -> str:
+    """One conversation, from wake word to silence. Returns why it closed.
+
+    The wake word opens a session rather than a single exchange. Each answer is
+    followed by a short window in which speech continues the SAME conversation,
+    so a follow-up like "and what about tomorrow" has the earlier turns to
+    resolve against. The window starts only once playback has actually finished,
+    which matters: measuring it from when the answer was generated would open
+    the microphone while the speakers were still going and feed the assistant
+    its own voice.
+    """
+    settings = brain.cfg.get("session", {}) or {}
+    follow_up = float(settings.get("follow_up_timeout_s", 5))
+    max_turns = int(settings.get("max_turns", 12))
+    max_duration = float(settings.get("max_duration_s", 180))
+
+    brain.reset()          # a new wake word always starts clean
+    opened = time.monotonic()
+    log.info(
+        "session open (follow-up window %.0fs, max %d turns, max %.0fs)",
+        follow_up, max_turns, max_duration,
+    )
+
+    turns = 0
+    try:
+        while True:
+            first = turns == 0
+            if first:
+                speaker.beep("ready")     # immediate feedback, before anything slow
+
+            turn_started = time.monotonic()
+            # The first turn gets the configured start timeout; a follow-up gets
+            # the shorter session window.
+            clip = recorder.record(start_timeout_s=None if first else follow_up)
+            if clip is None:
+                return "you stopped speaking" if first else "silence"
+
+            stt_started = time.monotonic()
+            text, backend = transcriber.transcribe(clip)
+            stt_ms = int((time.monotonic() - stt_started) * 1000)
+
+            # Neither an empty transcription nor a Whisper hallucination counts
+            # as speech, so neither keeps the session alive.
+            if not text:
+                log.info("could not transcribe that")
+                return "nothing intelligible"
+            if not usable_transcript(text, brain.cfg):
+                return "nothing intelligible"
+
+            turns += 1
+            print(f"you> {text}   [{backend}]")
+            log.info("session turn %d: %r", turns, text[:80])
+            handle_turn(text, brain, speaker, transcriber, stt_ms, turn_started)
+
+            if turns >= max_turns:
+                return f"reached {max_turns} turns"
+            if time.monotonic() - opened >= max_duration:
+                return f"reached the {max_duration:.0f} second limit"
+    finally:
+        # Drop the conversation with the session: the next wake word starts clean
+        # and a long session cannot leave context behind.
+        brain.reset()
+
+
 def wake_mode(
     brain: Brain,
     speaker: Speaker,
@@ -356,32 +425,20 @@ def wake_mode(
             if not listener.wait_for_wake():
                 return 1
 
-            turn_started = time.monotonic()
-            speaker.beep("ready")   # immediate feedback, before anything slow
-
-            clip = recorder.record()
-            if clip is None:
-                log.info("nothing was said after the wake word")
-                continue
-
-            stt_started = time.monotonic()
-            text, backend = transcriber.transcribe(clip)
-            stt_ms = int((time.monotonic() - stt_started) * 1000)
-            if not text:
-                log.info("could not transcribe that")
-                continue
-            if not usable_transcript(text, brain.cfg):
-                continue
-
-            print(f"you> {text}   [{backend}]")
-            handle_turn(text, brain, speaker, transcriber, stt_ms, turn_started)
+            started = time.monotonic()
+            reason = run_session(brain, speaker, recorder, transcriber)
+            log.info(
+                "session closed after %.0fs: %s. Waiting for the wake word.",
+                time.monotonic() - started, reason,
+            )
+            speaker.beep("session_close")
 
         except KeyboardInterrupt:
             print()
             return 0
         except Exception:
             # A bad turn must never take the daemon down.
-            log.exception("that turn failed; still listening")
+            log.exception("that session failed; still listening")
 
 
 def build_parser() -> argparse.ArgumentParser:
