@@ -70,6 +70,21 @@ def _alarm_at(hour: int, tomorrow: bool | None = None) -> ArgCheck:
     return check
 
 
+
+def seconds_until_recovery(brain: Brain, cap: float = 90.0) -> float:
+    """How long until the soonest benched provider is worth trying again."""
+    soonest = None
+    for provider in brain.cfg.enabled_providers():
+        until = brain.state.dead_until(provider["name"])
+        if until is None:
+            return 0.0                      # something is already usable
+        soonest = until if soonest is None else min(soonest, until)
+    if soonest is None:
+        return 0.0
+    remaining = (soonest - datetime.now().astimezone()).total_seconds()
+    return max(0.0, min(remaining + 2, cap))
+
+
 def build_cases(cfg: Config) -> list[tuple[str, str | None, ArgCheck | None]]:
     """(command, expected tool or None for 'no tool call', argument check)."""
     return [
@@ -175,6 +190,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", default=None, help="path to config.yaml")
     parser.add_argument("--verbose", action="store_true", help="log the full round trip")
     parser.add_argument("--self-test", action="store_true", help="check the scorer, no model calls")
+    parser.add_argument("--max-wait", type=float, default=90.0,
+                        help="longest to wait for a rate-limited provider before failing a case")
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -218,12 +235,25 @@ def main(argv: list[str] | None = None) -> int:
 
     for index, (command, expected, check) in enumerate(cases, start=1):
         brain.reset()
-        try:
-            reply = brain.ask(command)
-        except ProviderError as exc:
-            print(f"{index:2}. ERROR {command}")
-            print(f"      all providers failed: {exc}")
-            failures.append(f"{command} (provider failure)")
+        reply = None
+        for attempt in (1, 2):
+            try:
+                reply = brain.ask(command)
+                break
+            except ProviderError as exc:
+                # Free tiers bench a provider for seconds when a burst drains
+                # the token bucket. Waiting that out measures the model rather
+                # than the quota.
+                wait = seconds_until_recovery(brain, cap=args.max_wait)
+                if attempt == 1 and wait > 0:
+                    print(f"{index:2}. .... {command}  (waiting {wait:.0f}s for a provider)")
+                    time.sleep(wait)
+                    continue
+                print(f"{index:2}. ERROR {command}")
+                print(f"      {exc}")
+                failures.append(f"{command} (provider failure)")
+                break
+        if reply is None:
             continue
 
         ok, why = grade(expected, check, reply.tool_calls)

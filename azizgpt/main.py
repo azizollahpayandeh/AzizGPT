@@ -13,7 +13,7 @@ import sys
 import time
 from pathlib import Path
 
-from .brain import Brain, ProviderError, check_providers
+from .brain import Brain, ProviderError, check_providers, providers_status
 from .config import ConfigError, load_config
 from .gate import PlaybackGate
 from .recorder import Recorder, list_devices
@@ -62,7 +62,7 @@ def text_mode(brain: Brain, speaker: Speaker | None = None) -> int:
         try:
             reply = brain.ask(line)
         except ProviderError as exc:
-            print(f"aziz> I could not reach any language provider ({exc}).")
+            print(f"aziz> {exc}")
             continue
 
         if brain.verbose and reply.tool_calls:
@@ -274,7 +274,8 @@ def handle_turn(
     except ProviderError as exc:
         log.error("no provider answered: %s", exc)
         if speaker is not None:
-            speaker.speak("I could not reach any language provider just now.")
+            speaker.speak(str(exc))
+        print(f"aziz> {exc}")
         return
 
     print(f"aziz> {reply.text}")
@@ -354,6 +355,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text", action="store_true", help="typed REPL, no mic and no speech")
     parser.add_argument("--verbose", action="store_true", help="log the full tool-calling round trip")
     parser.add_argument("--check-providers", action="store_true", help="list which configured models are actually available")
+    parser.add_argument("--providers-status", action="store_true", help="show each provider: enabled, key, alive or dead, and last error")
     parser.add_argument("--config", default=None, help="path to config.yaml")
     parser.add_argument("--model", default=None, help="override the configured LLM model for this run")
     parser.add_argument("--dry-run", action="store_true", help="validate tool calls without side effects")
@@ -376,6 +378,9 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
+
+    if args.providers_status:
+        return providers_status(cfg)
 
     if args.check_providers:
         return check_providers(cfg, verbose=args.verbose)

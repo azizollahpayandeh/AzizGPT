@@ -81,6 +81,11 @@ only that timestamp. Never pass a command, a flag, or a shell line to any tool.
 After a tool runs you get its result. Some tools answer with JSON. That result \
 is the only fact you have about what happened: report it and nothing else.
 
+Never read out JSON, field names, tool names, or your own thinking. The user \
+hears only your sentence, so it must be the answer itself, not an account of \
+how you arrived at it. Do not begin with phrases like "We need to" or "The tool \
+returned".
+
 If the result says ok is true, say in one natural sentence what was done, using \
 the details in the result, for example "Opened youtube.com." If it says ok is \
 false, say it did not work and give the reason from the result. Never invent a \
@@ -171,6 +176,28 @@ MIN_SENTENCE_CHARS = 40    # "e.g." is not a sentence, and every sentence costs
                            # one TTS round trip, so do not chop into fragments
 
 
+
+def normalise_arguments(raw: Any) -> tuple[dict[str, Any], bool]:
+    """Tool arguments as (dict, parsed_ok), whichever shape the provider used.
+
+    Groq and OpenRouter both send a JSON string, but the field is typed loosely
+    across OpenAI-compatible backends and some return an object. Normalise here
+    rather than discovering it the first time the fallback tier is load-bearing.
+
+    `parsed_ok` is False only when the text was genuinely unreadable, so an
+    empty-argument call like "{}" does not look like a failure.
+    """
+    if isinstance(raw, dict):
+        return raw, True
+    if raw is None or str(raw).strip() == "":
+        return {}, True
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}, False
+    return (parsed, True) if isinstance(parsed, dict) else ({}, False)
+
+
 @dataclass
 class _Call:
     """One tool call, however it arrived: whole or assembled from deltas."""
@@ -199,6 +226,18 @@ def split_sentence(buffer: str) -> tuple[str | None, str]:
         if head:
             return head.strip(), tail + buffer[MAX_SENTENCE_CHARS:]
     return None, buffer
+
+
+
+def describe_failures(failures: list[tuple[str, str]]) -> str:
+    """A sentence a person can act on, not a stack of codes."""
+    if not failures:
+        return "no provider was available"
+    if len(failures) == 1:
+        name, reason = failures[0]
+        return f"{name} is unavailable: {reason}"
+    parts = [f"{name} because {reason}" for name, reason in failures]
+    return "no provider could answer. " + "; ".join(parts)
 
 
 @dataclass
@@ -271,8 +310,31 @@ class ProviderState:
         return until
 
     def clear(self, name: str) -> None:
-        if self.data.pop(name, None) is not None:
-            self._save()
+        entry = self.data.get(name)
+        if not entry:
+            return
+        # Keep the diagnostic history, drop only the dead mark.
+        entry.pop("dead_until", None)
+        entry.pop("reason", None)
+        if not entry:
+            self.data.pop(name, None)
+        self._save()
+
+    def record_error(self, name: str, message: str) -> None:
+        entry = self.data.setdefault(name, {})
+        entry["last_error"] = message[:300]
+        entry["last_error_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+        self._save()
+
+    def record_success(self, name: str) -> None:
+        entry = self.data.setdefault(name, {})
+        entry["last_success_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+        entry.pop("dead_until", None)
+        entry.pop("reason", None)
+        self._save()
+
+    def describe(self, name: str) -> dict[str, str]:
+        return dict(self.data.get(name, {}))
 
 
 def _retry_after_seconds(exc: APIStatusError) -> float | None:
@@ -343,113 +405,145 @@ class Brain:
         return self._clients[name]
 
     # ------------------------------------------------------------- routing --
+    def _attempt(
+        self, provider: dict[str, Any], messages: list[dict[str, Any]], stream: bool
+    ) -> tuple[Any, str | None]:
+        """Try one provider. Returns (response, failure reason in plain words)."""
+        llm = self.cfg["llm"]
+        name = provider["name"]
+        attempts = int(llm.get("rate_limit_retries", 3))
+        max_sleep = float(llm.get("max_retry_sleep", 60))
+
+        key = Config.api_key_for(provider)
+        problem = key_problem(key)
+        if problem:
+            return None, f"its key ({provider['api_key_env']}) {problem}"
+
+        client = self._client(provider, key)
+        model = self.model_for(provider)
+
+        for attempt in range(1, attempts + 1):
+            try:
+                log.debug("provider %s: calling %s (attempt %d)", name, model, attempt)
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    tools=self.schemas,
+                    tool_choice="auto",
+                    temperature=float(llm.get("temperature", 0.2)),
+                    max_tokens=int(llm.get("max_tokens", 700)),
+                    stream=stream,
+                )
+                return response, None
+
+            except RateLimitError as exc:
+                retry_after = _retry_after_seconds(exc)
+                if _is_daily_quota(exc, retry_after):
+                    until = self._bench(name, retry_after)
+                    return None, (
+                        f"it is out of its daily quota until "
+                        f"{until.strftime('%H:%M')}"
+                    )
+
+                if attempt >= attempts:
+                    log.info(
+                        "provider %s: still rate limited after %d attempts", name, attempts
+                    )
+                    return None, "it is rate limited right now"
+
+                nap = min(retry_after if retry_after is not None else 5.0, max_sleep)
+                log.info(
+                    "provider %s: per-minute rate limit, sleeping %.1fs then "
+                    "retrying (%d/%d)", name, nap, attempt, attempts,
+                )
+                time.sleep(nap)
+
+            except APIConnectionError as exc:
+                log.info("provider %s: connection failed (%s)", name, exc.__class__.__name__)
+                return None, "it could not be reached over the network"
+
+            except APIStatusError as exc:
+                log.info("provider %s: HTTP %s from the API", name, exc.status_code)
+                if exc.status_code in (401, 403):
+                    return None, f"it rejected the key (HTTP {exc.status_code})"
+                if exc.status_code == 404:
+                    return None, f"the model {model} was not found on it"
+                return None, f"it returned HTTP {exc.status_code}"
+
+        return None, "it is rate limited right now"
+
+    def _bench(self, name: str, retry_after: float | None) -> datetime:
+        """Mark a provider out of daily quota, for as short a time as defensible.
+
+        Groq's per-day buckets refill continuously and the 429 usually says when.
+        Benching until local midnight on a 429 that carried a few minutes of
+        backoff costs the provider for hours. When no retry-after is given,
+        probe again after llm.daily_probe_after_s rather than waiting blindly.
+        """
+        midnight = ProviderState.next_midnight()
+        now = datetime.now().astimezone()
+        if retry_after:
+            until = min(midnight, now + timedelta(seconds=retry_after))
+        else:
+            probe_after = float(self.cfg["llm"].get("daily_probe_after_s", 900))
+            until = min(midnight, now + timedelta(seconds=probe_after))
+        self.state.mark_dead_until(name, until, "daily quota")
+        log.info(
+            "provider %s: daily quota exhausted, will probe again at %s",
+            name, until.strftime("%Y-%m-%d %H:%M"),
+        )
+        return until
+
     def _complete(
         self, messages: list[dict[str, Any]], stream: bool = False
     ) -> tuple[dict[str, Any], Any]:
-        llm = self.cfg["llm"]
-        attempts = int(llm.get("rate_limit_retries", 3))
-        max_sleep = float(llm.get("max_retry_sleep", 60))
-        failures: list[str] = []
         enabled = self.cfg.enabled_providers()
-
         if not enabled:
             raise ProviderError("no providers are enabled in config.yaml")
+
+        failures: list[tuple[str, str]] = []
+        benched: list[dict[str, Any]] = []
 
         for provider in enabled:
             name = provider["name"]
 
-            until = self.state.dead_until(name) if self.state.is_dead(name) else None
-            if until:
-                log.info(
-                    "provider %s is exhausted until %s, switching to the next provider",
-                    name, until.strftime("%Y-%m-%d %H:%M"),
-                )
-                failures.append(f"{name}: quota exhausted until {until:%H:%M}")
+            if self.state.is_dead(name):
+                until = self.state.dead_until(name)
+                when = until.strftime("%H:%M") if until else "later"
+                log.info("provider %s is exhausted until %s, trying the next one", name, when)
+                failures.append((name, f"it is out of its daily quota until {when}"))
+                benched.append(provider)
                 continue
 
-            key = Config.api_key_for(provider)
-            problem = key_problem(key)
-            if problem:
+            response, reason = self._attempt(provider, messages, stream)
+            if response is not None:
+                self.state.record_success(name)
+                return provider, response
+
+            log.info("provider %s failed: %s, switching to the next provider", name, reason)
+            self.state.record_error(name, reason or "unknown")
+            failures.append((name, reason or "it failed"))
+
+        # Nothing answered. A dead mark is an optimisation, not a promise: if it
+        # left us with no provider at all, ignore it and try anyway. Answering
+        # badly beats not answering.
+        if benched and bool(self.cfg["llm"].get("last_resort_retry", True)):
+            for provider in benched:
+                name = provider["name"]
                 log.warning(
-                    "provider %s: %s %s, skipping",
-                    name, provider["api_key_env"], problem,
+                    "every provider is marked exhausted; trying %s anyway rather "
+                    "than giving up", name,
                 )
-                failures.append(f"{name}: {provider['api_key_env']} {problem}")
-                continue
-
-            client = self._client(provider, key)
-            model = self.model_for(provider)
-
-            for attempt in range(1, attempts + 1):
-                try:
-                    log.debug("provider %s: calling %s (attempt %d)", name, model, attempt)
-                    response = client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        tools=self.schemas,
-                        tool_choice="auto",
-                        temperature=float(llm.get("temperature", 0.2)),
-                        max_tokens=int(llm.get("max_tokens", 700)),
-                        stream=stream,
-                    )
+                response, reason = self._attempt(provider, messages, stream)
+                if response is not None:
+                    log.info("provider %s answered despite its mark; clearing it", name)
+                    self.state.record_success(name)
                     return provider, response
+                self.state.record_error(name, reason or "unknown")
+                failures = [(n, r) for n, r in failures if n != name]
+                failures.append((name, reason or "it failed"))
 
-                except RateLimitError as exc:
-                    retry_after = _retry_after_seconds(exc)
-                    if _is_daily_quota(exc, retry_after):
-                        # Same reasoning as the TTS path: Groq's per-day token
-                        # bucket refills continuously and the response says
-                        # when. Benching a working provider until midnight over
-                        # a few minutes of backoff costs far more than it saves.
-                        midnight = ProviderState.next_midnight()
-                        until = midnight
-                        if retry_after:
-                            recovers = datetime.now().astimezone() + timedelta(
-                                seconds=retry_after
-                            )
-                            until = min(midnight, recovers)
-                        self.state.mark_dead_until(name, until, "daily quota")
-                        log.info(
-                            "provider %s: daily quota exhausted, marked dead until %s, "
-                            "switching to the next provider",
-                            name, until.strftime("%Y-%m-%d %H:%M"),
-                        )
-                        failures.append(f"{name}: daily quota exhausted")
-                        break
-
-                    if attempt >= attempts:
-                        log.info(
-                            "provider %s: still rate limited after %d attempts, "
-                            "switching to the next provider", name, attempts,
-                        )
-                        failures.append(f"{name}: rate limited")
-                        break
-
-                    nap = min(retry_after if retry_after is not None else 5.0, max_sleep)
-                    log.info(
-                        "provider %s: per-minute rate limit, sleeping %.1fs then "
-                        "retrying (%d/%d)", name, nap, attempt, attempts,
-                    )
-                    time.sleep(nap)
-
-                except APIConnectionError as exc:
-                    log.info(
-                        "provider %s: connection failed (%s), switching to the next provider",
-                        name, exc.__class__.__name__,
-                    )
-                    failures.append(f"{name}: connection failed")
-                    break
-
-                except APIStatusError as exc:
-                    log.info(
-                        "provider %s: HTTP %s from the API, switching to the next provider",
-                        name, exc.status_code,
-                    )
-                    failures.append(f"{name}: HTTP {exc.status_code}")
-                    break
-
-        raise ProviderError("; ".join(failures) or "no usable provider")
-
+        raise ProviderError(describe_failures(failures))
 
     def _consume_stream(self, response: Any, on_sentence: Any) -> tuple[str, list[_Call]]:
         """Assemble a streamed round, speaking each sentence as it completes."""
@@ -470,8 +564,14 @@ class Brain:
                     slot["id"] = part.id
                 function = getattr(part, "function", None)
                 if function is not None:
+                    # Groq sends the name once; accumulate in case a provider
+                    # splits it across deltas the way it splits arguments.
                     if function.name:
-                        slot["name"] = function.name
+                        slot["name"] = (
+                            function.name
+                            if function.name.startswith(slot["name"] or "\0")
+                            else slot["name"] + function.name
+                        )
                     if function.arguments:
                         slot["arguments"] += function.arguments
 
@@ -514,7 +614,12 @@ class Brain:
             message = response.choices[0].message
             content = (message.content or "").strip()   # never message.reasoning
             calls = [
-                _Call(c.id, c.function.name, c.function.arguments or "{}")
+                _Call(
+                    c.id or "",
+                    c.function.name,
+                    c.function.arguments if isinstance(c.function.arguments, str)
+                    else json.dumps(c.function.arguments or {}),
+                )
                 for c in (message.tool_calls or [])
             ]
         return content, calls, provider
@@ -585,13 +690,12 @@ class Brain:
 
             for call in calls:
                 name = call.name
-                try:
-                    args = json.loads(call.arguments or "{}")
-                    if not isinstance(args, dict):
-                        args = {}
-                except ValueError:
-                    log.warning("tool %s: arguments were not valid JSON", name)
-                    args = {}
+                args, parsed_ok = normalise_arguments(call.arguments)
+                if not parsed_ok:
+                    log.warning(
+                        "tool %s: could not read the arguments %r; treating them "
+                        "as empty", name, call.arguments,
+                    )
 
                 made.append((name, args))
                 if self.verbose:
@@ -637,6 +741,68 @@ class Brain:
             llm_ms=llm_ms,
             first_sentence_ms=first_ms,
         )
+
+
+
+def providers_status(cfg: Config) -> int:
+    """--providers-status: the whole chain at a glance, without reading logs."""
+    state = ProviderState(cfg.state_dir() / STATE_FILENAME)
+    now = datetime.now().astimezone()
+    print(f"provider chain, in order   ({now.strftime('%Y-%m-%d %H:%M:%S %Z')})\n")
+
+    usable = 0
+    for position, provider in enumerate(cfg.providers, start=1):
+        name = provider["name"]
+        enabled = bool(provider.get("enabled"))
+        key = Config.api_key_for(provider)
+        problem = key_problem(key)
+        info = state.describe(name)
+        until = state.dead_until(name)
+        dead = bool(until and now < until)
+
+        if not enabled:
+            health = "disabled"
+        elif problem:
+            health = "UNUSABLE"
+        elif dead:
+            health = "DEAD"
+        else:
+            health = "alive"
+            usable += 1
+
+        print(f"{position}. {name}   [{health}]")
+        print(f"     model        {provider.get('model')}")
+        print(f"     base url     {provider.get('base_url')}")
+        print(f"     enabled      {enabled}")
+        print(f"     key          {provider['api_key_env']}: "
+              f"{'missing or invalid - ' + problem if problem else 'present'}")
+        if dead and until:
+            remaining = until - now
+            minutes = int(remaining.total_seconds() // 60)
+            print(f"     dead until   {until.strftime('%Y-%m-%d %H:%M:%S')} "
+                  f"(in {minutes} min)   reason: {info.get('reason', 'unknown')}")
+        else:
+            print("     dead until   -")
+        print(f"     last error   {info.get('last_error', '-')}")
+        if info.get("last_error_at"):
+            print(f"     last error at {info['last_error_at']}")
+        if info.get("last_success_at"):
+            print(f"     last success {info['last_success_at']}")
+        print()
+
+    tts = cfg.get("tts", {}) or {}
+    tts_key = f"{tts.get('provider', 'groq')}-tts"
+    tts_until = state.dead_until(tts_key)
+    if tts_until and now < tts_until:
+        print(f"speech: {tts.get('model')} is out of quota until "
+              f"{tts_until.strftime('%H:%M')}; piper is speaking instead\n")
+
+    if usable:
+        print(f"{usable} provider(s) ready to take a request.")
+        return 0
+    print("No provider is currently usable. The next request will still try the "
+          "benched ones rather than give up (llm.last_resort_retry).")
+    return 1
 
 
 def check_providers(cfg: Config, verbose: bool = False) -> int:

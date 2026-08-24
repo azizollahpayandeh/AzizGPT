@@ -153,26 +153,37 @@ under its own key, because Orpheus and the LLM exhaust independently.
 
 ### The loop
 
+Two passes. The first honours the dead marks; the second exists so that a fully
+benched chain still answers.
+
 ```
-for provider in enabled providers:
+PASS 1 — honour the marks
+  for provider in enabled providers, in order:
         │
-        ├── marked dead and not yet expired? ──▶ log, next provider
-        ├── key missing or malformed?         ──▶ log by shape, next provider
+        ├── marked dead, not yet expired? ──▶ remember it, next provider
+        ├── key missing or malformed?      ──▶ record reason, next provider
         │
         └── for attempt in 1..rate_limit_retries:
-                  │
-                  ├── success ─────────────────▶ return
-                  │
-                  ├── 429, per-minute  ────────▶ sleep min(retry-after, cap)
-                  │                              and retry this provider
-                  │
-                  ├── 429, daily quota ────────▶ mark dead, next provider
-                  │
-                  ├── connection error ────────▶ next provider
-                  └── other HTTP status ───────▶ next provider
+                  ├── success ──────────────▶ record_success, clear mark, RETURN
+                  ├── 429 per-minute ───────▶ sleep min(retry-after, cap), retry
+                  ├── 429 daily quota ──────▶ bench, next provider
+                  ├── connection error ─────▶ next provider
+                  └── other HTTP status ────▶ next provider
 
-all exhausted ──▶ ProviderError with a per-provider reason
+PASS 2 — only if pass 1 found nothing and something was benched
+  for provider in the ones that were benched:
+        └── try it anyway, ignoring the mark
+                  └── success ──────────────▶ clear the mark, RETURN
+
+still nothing ──▶ ProviderError carrying a plain-language reason per provider
 ```
+
+The second pass is the important part. A dead mark is an optimisation to avoid
+paying for a request that will fail; it is not a promise that the provider is
+unusable. Treating it as a hard block produced the worst outcome in practice:
+the assistant answered "I could not reach any language provider" while the API
+was healthy, because a stale mark from a burst of 429s was still in force.
+`llm.last_resort_retry` (default true) makes that unreachable.
 
 ### Classifying a 429
 
@@ -190,16 +201,80 @@ Limit 200000, Used 199715, Requested 936. Please try again in 4m41.232s.
 
 ### Dead until when
 
-The obvious implementation marks a daily-quota provider dead until local
-midnight. That is wrong for Groq, whose per-day bucket refills continuously —
-the message above says four minutes, not eleven hours.
+```
+retry-after present   ──▶ min(local midnight, now + retry-after)
+retry-after absent    ──▶ min(local midnight, now + llm.daily_probe_after_s)
+```
 
-The router marks `min(local_midnight, now + retry_after)`. Without the cap, a
-provider that recovers in minutes is benched for the rest of the day. This was
-observed live: the harness had Groq marked dead until midnight while a direct
-probe returned 200 with 7923 tokens remaining.
+The obvious implementation benches a daily-quota provider until local midnight.
+That is wrong for Groq, whose per-day bucket refills continuously — the message
+above says four minutes, not eleven hours. It was observed live: the harness had
+Groq marked dead until midnight while a direct probe returned 200 with 7923
+tokens remaining.
 
-Local midnight remains the fallback for a 429 that gives no `retry-after`.
+The `daily_probe_after_s` branch matters just as much. A 429 with no
+`retry-after` used to fall back to midnight, which is how a provider was lost
+for an entire evening. Probing again after fifteen minutes costs one wasted
+request and recovers automatically.
+
+Expiry is lazy: `is_dead()` compares against the clock and clears the mark when
+it has passed, so the next request after the window probes naturally rather than
+waiting for a timer.
+
+### Failure reporting
+
+`ProviderError` carries a sentence, not a status code, because it is spoken
+aloud:
+
+```
+no provider could answer. groq because it is out of its daily quota until 15:12;
+openrouter because it rejected the key (HTTP 401)
+```
+
+Per-provider reasons are produced by `_attempt()` and joined by
+`describe_failures()`. `--providers-status` reads the same persisted state and
+adds the last error and its timestamp.
+
+### State written per provider
+
+```json
+{
+  "groq": {
+    "dead_until":      "2026-08-24T15:12:00+03:30",
+    "reason":          "daily quota",
+    "last_error":      "it is out of its daily quota until 15:12",
+    "last_error_at":   "2026-08-24T14:47:24+03:30",
+    "last_success_at": "2026-08-24T14:41:02+03:30"
+  }
+}
+```
+
+A successful call clears `dead_until` and `reason` but keeps the history, so
+`--providers-status` can still show what went wrong last time.
+
+### Two providers, one interface
+
+Tier 2 is OpenRouter running `nvidia/nemotron-3-nano-30b-a3b:free`. It was
+picked by querying `/models`, keeping entries that are free *and* declare
+`tools` in `supported_parameters`, and then running the shortlist against this
+project's real schemas — declaring support and doing it are different things,
+and two of the four candidates were rate limited on their first call.
+
+The response shapes proved compatible with Groq's, which was checked rather than
+assumed:
+
+| Field | Groq | OpenRouter (nemotron) |
+| --- | --- | --- |
+| `message.content` on a tool call | `""` | `None` |
+| `tool_calls[].function.arguments` | JSON string | JSON string |
+| `tool_calls[].id` | present | present |
+| streaming deltas | index-based | index-based |
+| `reasoning` field | present, never read | present, never read |
+
+`normalise_arguments()` accepts a string or an object and reports whether it
+parsed, so an empty-argument call (`"{}"`) is not mistaken for a malformed one.
+Streamed tool-call names are accumulated rather than overwritten, in case a
+provider fragments the name the way it fragments arguments.
 
 ### Streaming and tool calls
 

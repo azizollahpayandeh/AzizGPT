@@ -12,12 +12,14 @@ providers:
     model: openai/gpt-oss-20b        # or openai/gpt-oss-120b
     enabled: true
 
-  # Template. Add OPENROUTER_API_KEY to .env and flip enabled to true.
+  # Second tier. Verified free and tool-calling capable: the model declares
+  # "tools" in supported_parameters on /models, and was checked against this
+  # project's real schemas (open_app, get_weather, and a no-tool question).
   - name: openrouter
     base_url: https://openrouter.ai/api/v1
     api_key_env: OPENROUTER_API_KEY
-    model: openai/gpt-oss-20b
-    enabled: false
+    model: nvidia/nemotron-3-nano-30b-a3b:free
+    enabled: true
 
 llm:
   stream: true                 # speak the first sentence before the rest arrives
@@ -28,6 +30,11 @@ llm:
   history_turns: 6             # rolling conversation memory, user+assistant pairs
   rate_limit_retries: 3        # per-minute 429 retries before moving on
   max_retry_sleep: 60          # cap on honouring retry-after, seconds
+  daily_probe_after_s: 900     # when a daily 429 carries no retry-after, probe
+                               # again after this long instead of waiting for
+                               # local midnight
+  last_resort_retry: true      # if every provider is marked dead, try anyway
+                               # rather than answering with nothing
 
 # Not used until phase 3/4. Listed here so nothing is hardcoded later.
 stt:

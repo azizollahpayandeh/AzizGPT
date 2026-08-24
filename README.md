@@ -32,7 +32,14 @@ $EDITOR .env          # set GROQ_API_KEY=gsk_...
 
 # 4. Confirm the key works and the configured models still exist
 python -m azizgpt.main --check-providers
+
+# 5. See the health of the whole provider chain at any time
+python -m azizgpt.main --providers-status
 ```
+
+`.env` also takes an optional `OPENROUTER_API_KEY`. The second tier ships
+enabled, so adding that key gives the assistant somewhere to go when Groq's
+free daily budget runs out.
 
 Then run it, starting with the mode that needs no microphone:
 
@@ -41,6 +48,15 @@ python -m azizgpt.main --text          # type commands, no mic, no speech
 python -m azizgpt.main --text --speak  # type commands, spoken answers
 python -m azizgpt.main --listen        # press Enter to talk
 python -m azizgpt.main --wake          # always on, say "hey jarvis"
+```
+
+Diagnostics:
+
+```bash
+python -m azizgpt.main --providers-status  # per-provider health and last error
+python -m azizgpt.main --mem               # memory, per component
+python -m azizgpt.main --list-devices      # audio devices
+python -m azizgpt.main --say "hello"       # test speech only
 ```
 
 For offline speech, download a Piper voice once:
@@ -116,6 +132,20 @@ Files map onto that pipeline directly:
 
 Providers are an ordered list in `config.yaml`. Each has a `name`, `base_url`, `api_key_env`, `model` and `enabled` flag. The first enabled provider that is not currently marked dead handles the request. An OpenRouter entry ships disabled as a template.
 
+Two tiers ship enabled:
+
+| Tier | Provider | Model | Notes |
+| --- | --- | --- | --- |
+| 1 | Groq | `openai/gpt-oss-20b` | Primary. Also serves speech-to-text and text-to-speech. |
+| 2 | OpenRouter | `nvidia/nemotron-3-nano-30b-a3b:free` | Free tier, verified tool-calling. |
+
+The fallback model was not chosen by reputation. OpenRouter's `/models` endpoint
+was filtered to entries that are free *and* list `tools` in
+`supported_parameters`, then the shortlist was run against this project's real
+schemas. Several models that advertise tool support were unusable in practice
+(rate limited on the first call); this one answered correctly on an `open_app`
+call, a `get_weather` call and a no-tool question.
+
 The two kinds of 429 are handled differently, because they mean different things:
 
 | Response | Handling |
@@ -123,9 +153,37 @@ The two kinds of 429 are handled differently, because they mean different things
 | Per-minute rate limit | Sleep for `retry-after` (capped by `llm.max_retry_sleep`) and retry the same provider, up to `llm.rate_limit_retries` times. |
 | Daily quota (TPD/RPD) | Mark the provider dead, persist that to `~/.local/state/azizgpt/providers.json`, and move down the chain. A restart does not re-hammer an exhausted provider. |
 
-The dead-until time is `min(local midnight, now + retry-after)`. Groq's per-day token bucket refills continuously and the 429 says when, so benching a provider until midnight over a few minutes of backoff costs far more than it saves. This was not theoretical: during development the LLM sat marked-dead-until-midnight while the API was returning 200.
+The dead-until time is `min(local midnight, now + retry-after)`, and when a 429
+carries no `retry-after` it is `min(local midnight, now + llm.daily_probe_after_s)`
+rather than midnight. Groq's per-day bucket refills continuously, so benching a
+provider until midnight over a few minutes of backoff costs far more than it
+saves. This was not theoretical: during development the LLM sat
+marked-dead-until-midnight while the API was returning 200.
 
-Every provider switch is logged at INFO.
+**A dead mark is an optimisation, not a promise.** If every provider in the chain
+is benched, the router makes a second pass and tries them anyway rather than
+answering with nothing (`llm.last_resort_retry`). A provider that answers on that
+pass has its mark cleared. The failure mode where the assistant says "I could not
+reach any language provider" and stops is therefore not reachable while any
+provider might still work.
+
+When the chain genuinely cannot answer, it says which provider failed and why, in
+words rather than status codes:
+
+```
+no provider could answer. groq because it is out of its daily quota until 15:12;
+openrouter because it rejected the key (HTTP 401)
+```
+
+Every provider switch is logged at INFO. To see the whole chain at a glance:
+
+```bash
+python -m azizgpt.main --providers-status
+```
+
+which prints, per provider: enabled, model, whether the key is present and
+well-formed, alive or dead, the dead-until timestamp with minutes remaining, and
+the last error it returned.
 
 The same logic guards text-to-speech under its own state key, so a spent Orpheus quota falls through to Piper for the rest of the window without re-paying the round trip on every turn.
 
@@ -160,6 +218,8 @@ Everything tunable lives in `config.yaml`. Model names are never hardcoded, beca
 | `llm.stream` | `true` | Stream completions |
 | `llm.max_tool_iterations` | `4` | Guard against tool-call ping-pong |
 | `llm.rate_limit_retries` | `3` | Per-minute 429 retries |
+| `llm.daily_probe_after_s` | `900` | Re-probe after a daily 429 that carried no retry-after |
+| `llm.last_resort_retry` | `true` | Try benched providers rather than answer nothing |
 | `llm.history_turns` | `6` | Rolling conversation memory |
 | `stt.model` | `whisper-large-v3-turbo` | Speech to text |
 | `stt.min_transcript_chars` | `2` | Below this is treated as silence |
@@ -221,7 +281,7 @@ Stated plainly, because they are real:
 
 - **No speaker identification.** The assistant cannot tell your voice from a video playing in the room. Ambient speech will trigger it and can be transcribed as a command. Set `wakeword.threshold` higher if this bites.
 - **No barge-in.** You cannot interrupt it mid-answer. The countdown before a power action is the only interruptible moment, and only from the terminal.
-- **Orpheus free tier is 3600 tokens per day.** That is roughly a few dozen spoken answers. After that it falls through to Piper, which is why Piper is wired in rather than optional. The LLM tier is 200k tokens/day, which a full test-harness run consumes about a third of.
+- **Free tiers are small.** Orpheus is 3600 tokens/day, roughly a few dozen spoken answers, after which speech falls through to Piper - which is why Piper is wired in rather than optional. Groq's LLM tier is 200k tokens/day, about a third of which a full harness run consumes. OpenRouter's free tier is **50 requests/day** without credits, so tier 2 is a genuine safety net for a handful of turns, not a full replacement for tier 1.
 - **English only.** The system prompt, the wake word model, the Whisper language pin and the Piper voice are all English.
 - **No echo cancellation.** The playback gate stops the assistant hearing *itself*; it does nothing about other audio in the room.
 - **Bluetooth speakers add latency.** Perceived latency measured 3.3–5.4 seconds from wake word to first audio, of which the biggest single component is text-to-speech synthesis.
@@ -251,6 +311,8 @@ Run it in a quiet room with nothing else playing, or it measures the room instea
 **`model_terms_required` from the TTS endpoint.** Some Groq models need a one-time terms acceptance in the console before the API will serve them. Open the model in <https://console.groq.com/playground>, accept, and retry. Speech falls through to Piper until you do.
 
 **`ModuleNotFoundError: No module named 'pkg_resources'`.** `webrtcvad` still imports it and setuptools 81 removed it. `requirements.txt` pins `setuptools<81`.
+
+**It says a provider is unavailable.** Run `python -m azizgpt.main --providers-status`. It shows which tier is benched, until when, and the last error each returned. A daily quota clears itself; a rejected key does not.
 
 **It transcribes silence as "." or "Thank you." and answers it.** The noise-floor gate is not tuned for your room. Raise `recorder.speech_over_floor`.
 
