@@ -10,11 +10,13 @@ The interesting part is not that it works, it is what happens when it mishears. 
 
 ## Quickstart
 
-Requires Python 3.11+ and a working PipeWire or PulseAudio setup.
+Requires Python 3.12+ (numpy 2.5 dropped 3.11) and a working PipeWire or
+PulseAudio setup.
 
 ```bash
 # 1. System dependencies (Debian/Ubuntu/Kali)
-sudo apt install -y python3-full portaudio19-dev ffmpeg libnotify-bin
+sudo apt install -y python3-full python3-dev build-essential \
+                    portaudio19-dev ffmpeg libnotify-bin
 
 # 2. Clone and set up
 git clone https://github.com/azizollahpayandeh/AzizGPT.git
