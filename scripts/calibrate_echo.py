@@ -13,8 +13,10 @@ was still coming out after the player exited.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -32,6 +34,62 @@ from azizgpt.tts import find_player, write_tone  # noqa: E402
 
 PHRASE = "This is a calibration clip. One, two, three, four, five, six, seven."
 SAFETY_MARGIN_S = 0.6
+
+
+
+# --------------------------------------------------------- audio safety net --
+# This script only plays a clip and listens; it does not change the mute state,
+# the volume, or the default device, and it must never start doing so silently.
+# The guard below snapshots that state and puts anything back in a finally
+# block, so a future edit that mutes something cannot leave a machine silent
+# after the process exits. That failure has happened once here already, from a
+# `wpctl set-mute` run by hand during an investigation: WirePlumber persists
+# per-application mute in ~/.local/state/wireplumber/stream-properties, so it
+# survived Chrome restarts and reboots and was invisible in `wpctl status`.
+AUDIO_TOOL = "wpctl"
+
+
+def _wpctl(*args: str) -> str | None:
+    binary = shutil.which(AUDIO_TOOL)
+    if binary is None:
+        return None
+    try:
+        result = subprocess.run(
+            [binary, *args], capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def snapshot_audio_state() -> dict[str, str]:
+    """Mute and volume of the default sink and source, as wpctl reports them."""
+    state = {}
+    for target in ("@DEFAULT_AUDIO_SINK@", "@DEFAULT_AUDIO_SOURCE@"):
+        reading = _wpctl("get-volume", target)
+        if reading is not None:
+            state[target] = reading
+    return state
+
+
+@contextlib.contextmanager
+def audio_state_unchanged():
+    """Restore any audio state this script altered, however it exits."""
+    before = snapshot_audio_state()
+    try:
+        yield
+    finally:
+        after = snapshot_audio_state()
+        for target, original in before.items():
+            if after.get(target) != original:
+                print(f"restoring {target}: {after.get(target)} -> {original}")
+                muted = "MUTED" in original
+                volume = original.split()[1] if len(original.split()) > 1 else None
+                if volume:
+                    _wpctl("set-volume", target, volume)
+                _wpctl("set-mute", target, "1" if muted else "0")
+        if before and after == before:
+            print("audio state unchanged, as intended")
 
 
 def listen(samples: list[tuple[float, float]], stop: threading.Event) -> None:
@@ -107,14 +165,17 @@ def main(argv: list[str] | None = None) -> int:
     with wave.open(str(clip)) as handle:
         duration = handle.getnframes() / handle.getframerate()
 
-    print(f"clip {duration:.2f}s, {args.trials} trials, speakers at their normal volume\n")
+    print(f"clip {duration:.2f}s, {args.trials} trials, speakers at their normal volume")
+    print("this script does not change mute, volume or the default device; any "
+          "change is restored on exit\n")
 
     tails = []
-    for index in range(1, args.trials + 1):
-        tail, peak, floor = one_trial(clip)
-        tails.append(tail)
-        verdict = "no audio detected" if peak == 0 else f"peak rms {peak:.0f}, floor {floor:.0f}"
-        print(f"  trial {index}: still audible {tail:.2f}s after the player exited   ({verdict})")
+    with audio_state_unchanged():
+        for index in range(1, args.trials + 1):
+            tail, peak, floor = one_trial(clip)
+            tails.append(tail)
+            verdict = "no audio detected" if peak == 0 else f"peak rms {peak:.0f}, floor {floor:.0f}"
+            print(f"  trial {index}: still audible {tail:.2f}s after the player exited   ({verdict})")
 
     worst = max(tails)
     recommended = round(worst + SAFETY_MARGIN_S, 1)

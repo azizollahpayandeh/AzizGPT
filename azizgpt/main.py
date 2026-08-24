@@ -11,6 +11,7 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 from .brain import Brain, ProviderError, check_providers, providers_status
@@ -236,6 +237,39 @@ def report_memory() -> int:
 
 
 
+def log_startup_identity(cfg) -> None:
+    """Say what code and config this process is actually running.
+
+    A long-lived unit keeps whatever it loaded at start. Editing config.yaml or
+    the source changes nothing until it is restarted, and the journal gave no
+    way to tell. This line makes a stale daemon obvious at a glance: compare the
+    timestamps against the files on disk.
+    """
+    from . import __version__
+
+    try:
+        config_mtime = datetime.fromtimestamp(cfg.path.stat().st_mtime)
+        config_stamp = config_mtime.strftime("%Y-%m-%d %H:%M:%S")
+    except OSError:
+        config_stamp = "unknown"
+
+    try:
+        code_mtime = datetime.fromtimestamp(Path(__file__).with_name("brain.py").stat().st_mtime)
+        code_stamp = code_mtime.strftime("%Y-%m-%d %H:%M:%S")
+    except OSError:
+        code_stamp = "unknown"
+
+    chain = ", ".join(
+        f"{p['name']}({p.get('model')})" for p in cfg.enabled_providers()
+    ) or "NONE ENABLED"
+    log.info(
+        "azizgpt %s starting: config %s (modified %s), brain.py modified %s",
+        __version__, cfg.path, config_stamp, code_stamp,
+    )
+    log.info("provider chain as loaded: %s", chain)
+
+
+
 def make_gate(cfg) -> PlaybackGate:
     settings = cfg.get("wakeword", {}) or {}
     return PlaybackGate(
@@ -405,6 +439,7 @@ def main(argv: list[str] | None = None) -> int:
             log.info("alarms: %d restored, %d expired", restored, dropped)
 
     if args.wake or args.listen:
+        log_startup_identity(cfg)
         try:
             lock = SingleInstance(cfg.state_dir())
             lock.acquire()

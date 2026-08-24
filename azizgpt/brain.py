@@ -383,25 +383,57 @@ class ProviderState:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.data: dict[str, dict[str, str]] = {}
+        self._stamp: tuple[int, int] | None = None
         self._load()
 
-    def _load(self) -> None:
+    def _stat(self) -> tuple[int, int] | None:
         try:
-            self.data = json.loads(self.path.read_text(encoding="utf-8"))
-            if not isinstance(self.data, dict):
-                self.data = {}
+            info = self.path.stat()
+        except OSError:
+            return None
+        return (info.st_mtime_ns, info.st_size)
+
+    def _read_file(self) -> dict[str, dict[str, str]]:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            self.data = {}
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _load(self) -> None:
+        self.data = self._read_file()
+        self._stamp = self._stat()
+
+    def refresh(self) -> None:
+        """Re-read if the file changed underneath us.
+
+        The daemon builds this once at startup and then lives for hours. Without
+        this, a mark written in the morning is honoured forever: clearing the
+        file, or another process recording a success, is invisible to it. That
+        is how --providers-status came to report every provider alive while the
+        running assistant insisted there were none.
+        """
+        if self._stat() != self._stamp:
+            log.debug("provider state changed on disk, re-reading")
+            self._load()
 
     def _save(self) -> None:
+        # Merge rather than overwrite: another process may own entries we have
+        # never seen, and one of us writing must not erase the other's marks.
+        merged = self._read_file()
+        merged.update(self.data)
         try:
             tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
+            tmp.write_text(json.dumps(merged, indent=2), encoding="utf-8")
             os.replace(tmp, self.path)
         except OSError as exc:
             log.warning("could not persist provider state: %s", exc.__class__.__name__)
+            return
+        self.data = merged
+        self._stamp = self._stat()
 
     def dead_until(self, name: str) -> datetime | None:
+        self.refresh()
         raw = self.data.get(name, {}).get("dead_until")
         if not raw:
             return None
@@ -430,20 +462,27 @@ class ProviderState:
         )
 
     def mark_dead_until(self, name: str, until: datetime, reason: str) -> datetime:
-        """Mark a provider unusable until a given time, and persist it."""
-        self.data[name] = {"dead_until": until.isoformat(), "reason": reason}
+        """Mark a provider unusable until a given time, and persist it.
+
+        Updates the entry rather than replacing it: the last error and the last
+        success are what --providers-status shows, and benching a provider is
+        exactly when that history matters.
+        """
+        entry = self.data.setdefault(name, {})
+        entry["dead_until"] = until.isoformat()
+        entry["reason"] = reason
         self._save()
         return until
 
     def clear(self, name: str) -> None:
         entry = self.data.get(name)
-        if not entry:
+        if entry is None:
             return
-        # Keep the diagnostic history, drop only the dead mark.
+        # Keep the diagnostic history, drop only the dead mark. The entry stays
+        # in place even when it empties: _save merges over what is on disk, so a
+        # popped key would simply be read back from the file and resurrected.
         entry.pop("dead_until", None)
         entry.pop("reason", None)
-        if not entry:
-            self.data.pop(name, None)
         self._save()
 
     def record_error(self, name: str, message: str) -> None:
@@ -460,6 +499,7 @@ class ProviderState:
         self._save()
 
     def describe(self, name: str) -> dict[str, str]:
+        self.refresh()
         return dict(self.data.get(name, {}))
 
 

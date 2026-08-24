@@ -329,6 +329,15 @@ python scripts/calibrate_echo.py --write    # write it into config.yaml
 
 Run it in a quiet room with nothing else playing, or it measures the room instead of your speakers.
 
+The script plays a clip and listens; it does not change your mute state, volume,
+or default device. It snapshots the default sink and source and restores them in
+a `finally` block regardless of how it exits, and prints what it restored, so a
+future edit cannot leave a machine silent after the process ends. If you mute
+something by hand while debugging audio, note that WirePlumber persists
+per-application mute in `~/.local/state/wireplumber/stream-properties`: it
+survives restarts and reboots and does not appear in `wpctl status` unless that
+application happens to be playing at the time.
+
 **Answers play twice, about a second apart.** Two daemons are running. Newer builds refuse the second start; if you are on an older one, `pgrep -af azizgpt.main` and kill the extra.
 
 **Everything fails with `could not locate runnable browser` or a proxy error.** If your shell exports `all_proxy=socks://...`, that scheme is invalid and the HTTP layer raises before any request is made. Use `socks5://` (with `pip install socksio`) or an `http://` proxy. AzizGPT resolves one usable proxy explicitly rather than letting the client read the environment, so `HTTPS_PROXY` alone is enough.
@@ -338,6 +347,23 @@ Run it in a quiet room with nothing else playing, or it measures the room instea
 **`model_terms_required` from the TTS endpoint.** Some Groq models need a one-time terms acceptance in the console before the API will serve them. Open the model in <https://console.groq.com/playground>, accept, and retry. Speech falls through to Piper until you do.
 
 **`ModuleNotFoundError: No module named 'pkg_resources'`.** `webrtcvad` still imports it and setuptools 81 removed it. `requirements.txt` pins `setuptools<81`.
+
+**The service says no provider is available, but `--text` works.** The unit runs
+the code and config it loaded at start. Editing `config.yaml` or the source
+changes nothing until it is restarted, so a provider added hours ago is simply
+not in the running chain. Check what it actually loaded:
+
+```bash
+journalctl --user -u azizgpt.service | grep 'provider chain as loaded'
+```
+
+It logs its version, the config path and modification time, the `brain.py`
+modification time, and the chain it built. If those timestamps are older than
+the files on disk, restart it:
+
+```bash
+systemctl --user restart azizgpt.service
+```
 
 **It says a provider is unavailable.** Run `python -m azizgpt.main --providers-status`. It shows which tier is benched, until when, and the last error each returned. A daily quota clears itself; a rejected key does not.
 
