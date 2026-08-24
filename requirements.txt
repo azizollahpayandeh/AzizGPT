@@ -24,3 +24,6 @@ piper-tts==1.7.0            # voice model downloaded separately, see README
 #
 # Only if you must reach the API through a SOCKS proxy.
 #   pip install socksio
+#
+# Development only (CI installs these; not needed to run the assistant):
+#   pip install pytest ruff

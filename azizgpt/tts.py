@@ -27,10 +27,12 @@ from openai import OpenAI, RateLimitError
 
 from .brain import (
     STATE_FILENAME,
+    TRANSIENT_RECOVERY_S,
     ProviderState,
-    _is_daily_quota,
-    _retry_after_seconds,
     build_http_client,
+    classify_rate_limit,
+    gather_evidence,
+    log_rate_limit,
 )
 from .config import Config, key_problem
 from .gate import PlaybackGate
@@ -293,20 +295,23 @@ class Speaker:
                 return path.stat().st_size > 0
 
             except RateLimitError as exc:
-                retry_after = _retry_after_seconds(exc)
-                if _is_daily_quota(exc, retry_after):
-                    # Local midnight is the default, but Groq's token-per-day
-                    # bucket refills continuously and the response says when.
-                    # Honour the shorter of the two rather than losing the
-                    # online voice for the rest of the day over a 20 minute cap.
+                # Same evidence-based rule as the LLM router: a 429 only takes
+                # the online voice offline when the response says recovery is
+                # far away. Ambiguous means transient.
+                evidence = gather_evidence(exc)
+                log_rate_limit(self.remote_label, evidence)
+                threshold = float(self.tts.get("transient_recovery_s", TRANSIENT_RECOVERY_S))
+                kind, seconds = classify_rate_limit(evidence, threshold)
+
+                if kind == "exhausted":
+                    now = datetime.now().astimezone()
                     midnight = ProviderState.next_midnight()
-                    until = midnight
-                    if retry_after:
-                        recovers = datetime.now().astimezone() + timedelta(seconds=retry_after)
-                        until = min(midnight, recovers)
-                    self.state.mark_dead_until(self.state_key, until, "tts daily quota")
+                    until = min(midnight, now + timedelta(seconds=seconds))
+                    self.state.mark_dead_until(
+                        self.state_key, until, evidence.limit_source or "rate limited"
+                    )
                     log.info(
-                        "%s daily quota exhausted; using piper until %s",
+                        "%s is rate limited until %s; piper will speak until then",
                         self.remote_label, until.strftime("%Y-%m-%d %H:%M"),
                     )
                     return False
@@ -318,9 +323,9 @@ class Speaker:
                     )
                     return False
 
-                nap = min(retry_after if retry_after is not None else 1.0, max_sleep)
+                nap = min(seconds if seconds is not None else 1.0, max_sleep)
                 log.info(
-                    "%s per-minute rate limit, retrying in %.1fs", self.remote_label, nap
+                    "%s transient rate limit, retrying in %.1fs", self.remote_label, nap
                 )
                 time.sleep(nap)
 

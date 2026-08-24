@@ -22,7 +22,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -38,12 +38,138 @@ log = logging.getLogger(__name__)
 
 STATE_FILENAME = "providers.json"
 
-# Markers Groq and friends use for a daily/lifetime quota rather than a per-minute one.
-DAILY_MARKERS = (
-    "per day", "requests per day", "tokens per day", "rpd", "tpd",
-    "daily limit", "daily quota", "quota exceeded", "insufficient_quota",
-)
-DAILY_SECONDS = 3600  # a retry-after longer than this is not a per-minute limit
+# A 429 is classified by WHEN IT RECOVERS, never by keywords alone. Groq calls a
+# bucket "tokens per day (TPD)" and then says to retry in 32 seconds, while
+# OpenRouter's free tier says "per day" and means 12 hours. Reading either as a
+# day-long outage takes a working provider offline; reading both as transient
+# hammers an exhausted one. The response says which it is, so ask the response.
+TRANSIENT_RECOVERY_S = 90.0     # recovers within this -> sleep, do not bench
+
+DURATION = re.compile(r"(?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m(?!s))?"
+                      r"(?:(\d+(?:\.\d+)?)s)?(?:(\d+(?:\.\d+)?)ms)?")
+TRY_AGAIN = re.compile(r"try again in ([0-9hms.]+)", re.I)
+
+
+def parse_duration(text: str) -> float | None:
+    """Seconds from strings like '31.5s', '46m4.8s', '585ms', '1h2m3s'."""
+    if not text:
+        return None
+    cleaned = str(text).strip().rstrip(".")
+    if cleaned.replace(".", "", 1).isdigit():
+        return float(cleaned)
+    match = DURATION.fullmatch(cleaned)
+    if not match or not any(match.groups()):
+        return None
+    hours, minutes, seconds, millis = match.groups()
+    total = 0.0
+    if hours:
+        total += float(hours) * 3600
+    if minutes:
+        total += float(minutes) * 60
+    if seconds:
+        total += float(seconds)
+    if millis:
+        total += float(millis) / 1000
+    return total
+
+
+@dataclass
+class RateLimitEvidence:
+    """Everything the response told us about a 429, before any judgement."""
+
+    message: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+    retry_after: float | None = None
+    reset_at: datetime | None = None
+    limit_source: str | None = None
+    limit: str | None = None
+    remaining: str | None = None
+
+    def recovery_seconds(self) -> float | None:
+        """Best evidence for how long until this provider works again."""
+        if self.retry_after is not None:
+            return self.retry_after
+        hinted = TRY_AGAIN.search(self.message or "")
+        if hinted:
+            parsed = parse_duration(hinted.group(1))
+            if parsed is not None:
+                return parsed
+        if self.reset_at is not None:
+            return max(0.0, (self.reset_at - datetime.now().astimezone()).total_seconds())
+        for header in ("x-ratelimit-reset-tokens", "x-ratelimit-reset-requests"):
+            parsed = parse_duration(self.headers.get(header, ""))
+            if parsed is not None:
+                return parsed
+        return None
+
+
+def gather_evidence(exc: Exception) -> RateLimitEvidence:
+    """Pull the facts out of a 429 without interpreting them."""
+    evidence = RateLimitEvidence(message=str(exc))
+
+    try:
+        evidence.headers = {k.lower(): v for k, v in exc.response.headers.items()}
+    except Exception:
+        evidence.headers = {}
+
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error") if isinstance(body.get("error"), dict) else body
+        if isinstance(error, dict):
+            evidence.message = str(error.get("message") or evidence.message)
+            metadata = error.get("metadata")
+            if isinstance(metadata, dict):
+                evidence.limit_source = metadata.get("limit_source")
+
+    raw_retry = evidence.headers.get("retry-after")
+    if raw_retry is not None:
+        evidence.retry_after = parse_duration(raw_retry)
+
+    # OpenRouter sends an absolute reset as epoch milliseconds.
+    raw_reset = evidence.headers.get("x-ratelimit-reset")
+    if raw_reset and raw_reset.isdigit():
+        stamp = int(raw_reset)
+        if stamp > 10_000_000_000:      # milliseconds
+            stamp /= 1000
+        try:
+            evidence.reset_at = datetime.fromtimestamp(stamp, tz=UTC).astimezone()
+        except (OverflowError, OSError, ValueError):
+            evidence.reset_at = None
+
+    evidence.limit = evidence.headers.get("x-ratelimit-limit")
+    evidence.remaining = evidence.headers.get("x-ratelimit-remaining")
+    return evidence
+
+
+def classify_rate_limit(
+    evidence: RateLimitEvidence, transient_recovery_s: float = TRANSIENT_RECOVERY_S
+) -> tuple[str, float | None]:
+    """Returns ("transient", seconds_to_wait) or ("exhausted", seconds_until_reset).
+
+    Evidence only. A 429 is treated as exhaustion solely when the response says
+    recovery is far away. Anything ambiguous - no retry-after, no reset, no
+    usable hint - is transient, because sleeping briefly on a real outage is
+    cheap and benching a healthy provider is not.
+    """
+    recovery = evidence.recovery_seconds()
+    if recovery is None:
+        return "transient", None
+    if recovery <= transient_recovery_s:
+        return "transient", recovery
+    return "exhausted", recovery
+
+
+def log_rate_limit(name: str, evidence: RateLimitEvidence) -> None:
+    """Everything the provider said, before we decide what it meant."""
+    log.info("provider %s: 429 body: %s", name, (evidence.message or "")[:400])
+    interesting = {
+        k: v for k, v in evidence.headers.items()
+        if "ratelimit" in k or k in ("retry-after", "date")
+    }
+    log.info("provider %s: 429 headers: %s", name, interesting or "(none)")
+    if evidence.limit_source:
+        log.info("provider %s: limit_source=%s", name, evidence.limit_source)
+
 
 SYSTEM_PROMPT = """You are AzizGPT, a voice assistant running on the user's Linux laptop.
 
@@ -337,26 +463,6 @@ class ProviderState:
         return dict(self.data.get(name, {}))
 
 
-def _retry_after_seconds(exc: APIStatusError) -> float | None:
-    try:
-        raw = exc.response.headers.get("retry-after")
-    except Exception:
-        return None
-    if raw is None:
-        return None
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return None
-
-
-def _is_daily_quota(exc: Exception, retry_after: float | None) -> bool:
-    if retry_after is not None and retry_after > DAILY_SECONDS:
-        return True
-    blob = str(exc).lower()
-    return any(marker in blob for marker in DAILY_MARKERS)
-
-
 # -------------------------------------------------------------------- brain --
 class Brain:
     def __init__(
@@ -437,12 +543,15 @@ class Brain:
                 return response, None
 
             except RateLimitError as exc:
-                retry_after = _retry_after_seconds(exc)
-                if _is_daily_quota(exc, retry_after):
-                    until = self._bench(name, retry_after)
+                evidence = gather_evidence(exc)
+                log_rate_limit(name, evidence)
+                threshold = float(llm.get("transient_recovery_s", TRANSIENT_RECOVERY_S))
+                kind, seconds = classify_rate_limit(evidence, threshold)
+
+                if kind == "exhausted":
+                    until = self._bench(name, seconds, evidence)
                     return None, (
-                        f"it is out of its daily quota until "
-                        f"{until.strftime('%H:%M')}"
+                        f"it is rate limited until {until.strftime('%H:%M')}"
                     )
 
                 if attempt >= attempts:
@@ -451,9 +560,9 @@ class Brain:
                     )
                     return None, "it is rate limited right now"
 
-                nap = min(retry_after if retry_after is not None else 5.0, max_sleep)
+                nap = min(seconds if seconds is not None else 5.0, max_sleep)
                 log.info(
-                    "provider %s: per-minute rate limit, sleeping %.1fs then "
+                    "provider %s: transient rate limit, sleeping %.1fs then "
                     "retrying (%d/%d)", name, nap, attempt, attempts,
                 )
                 time.sleep(nap)
@@ -472,25 +581,33 @@ class Brain:
 
         return None, "it is rate limited right now"
 
-    def _bench(self, name: str, retry_after: float | None) -> datetime:
-        """Mark a provider out of daily quota, for as short a time as defensible.
+    def _bench(
+        self, name: str, seconds: float | None, evidence: RateLimitEvidence
+    ) -> datetime:
+        """Mark a provider unusable until the moment the response points at.
 
-        Groq's per-day buckets refill continuously and the 429 usually says when.
-        Benching until local midnight on a 429 that carried a few minutes of
-        backoff costs the provider for hours. When no retry-after is given,
-        probe again after llm.daily_probe_after_s rather than waiting blindly.
+        The reset time is taken from the response, not assumed. Local midnight
+        is only a ceiling, never the default: benching a provider until midnight
+        on a 429 that recovers in minutes cost this project hours of
+        availability more than once.
         """
-        midnight = ProviderState.next_midnight()
         now = datetime.now().astimezone()
-        if retry_after:
-            until = min(midnight, now + timedelta(seconds=retry_after))
+        midnight = ProviderState.next_midnight()
+
+        if seconds is not None:
+            until = min(midnight, now + timedelta(seconds=seconds))
         else:
             probe_after = float(self.cfg["llm"].get("daily_probe_after_s", 900))
             until = min(midnight, now + timedelta(seconds=probe_after))
-        self.state.mark_dead_until(name, until, "daily quota")
+
+        reason = evidence.limit_source or "rate limited"
+        if evidence.limit and evidence.remaining is not None:
+            reason = f"{reason} ({evidence.remaining}/{evidence.limit} left)"
+        self.state.mark_dead_until(name, until, reason)
         log.info(
-            "provider %s: daily quota exhausted, will probe again at %s",
-            name, until.strftime("%Y-%m-%d %H:%M"),
+            "provider %s: rate limited beyond the transient threshold, will "
+            "try again at %s (%s)",
+            name, until.strftime("%Y-%m-%d %H:%M"), reason,
         )
         return until
 

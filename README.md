@@ -146,19 +146,45 @@ schemas. Several models that advertise tool support were unusable in practice
 (rate limited on the first call); this one answered correctly on an `open_app`
 call, a `get_weather` call and a no-tool question.
 
-The two kinds of 429 are handled differently, because they mean different things:
+### Classifying a 429
 
-| Response | Handling |
+A 429 is classified by **when the response says it recovers**, never by the
+words in it. That distinction is the whole design, because the wording lies in
+both directions:
+
+```
+Groq:        "... on tokens per day (TPD): Limit 200000, Used 200000.
+              Please try again in 31.535999999s."     retry-after: 32
+             -> says "per day", means 32 seconds
+
+OpenRouter:  "Rate limit exceeded: free-models-per-day. Add 10 credits to
+              unlock 1000 free model requests per day"
+              x-ratelimit-reset: 1787616000000  (UTC midnight, 12h away)
+             -> genuinely daily, and sends no retry-after at all
+```
+
+Reading Groq's wording as a day-long outage benched a healthy provider for
+hours. Reading OpenRouter's as transient would hammer a genuinely exhausted one.
+Neither is decidable from keywords, so the classifier reads evidence, in order:
+
+1. the `retry-after` header
+2. a `try again in X` hint in the message body
+3. `x-ratelimit-reset` (OpenRouter sends epoch milliseconds)
+4. Groq's `x-ratelimit-reset-tokens` / `-requests` duration headers
+
+| Recovery time | Handling |
 | --- | --- |
-| Per-minute rate limit | Sleep for `retry-after` (capped by `llm.max_retry_sleep`) and retry the same provider, up to `llm.rate_limit_retries` times. |
-| Daily quota (TPD/RPD) | Mark the provider dead, persist that to `~/.local/state/azizgpt/providers.json`, and move down the chain. A restart does not re-hammer an exhausted provider. |
+| ≤ `llm.transient_recovery_s` (90s) | Sleep and retry the same provider, up to `llm.rate_limit_retries` times. Never benched. |
+| Longer | Bench until exactly that timestamp, persisted to `~/.local/state/azizgpt/providers.json`, and move down the chain. |
+| **No evidence at all** | **Transient.** Sleeping on a real outage costs one wasted retry; benching a healthy provider costs every request until the mark expires. |
 
-The dead-until time is `min(local midnight, now + retry-after)`, and when a 429
-carries no `retry-after` it is `min(local midnight, now + llm.daily_probe_after_s)`
-rather than midnight. Groq's per-day bucket refills continuously, so benching a
-provider until midnight over a few minutes of backoff costs far more than it
-saves. This was not theoretical: during development the LLM sat
-marked-dead-until-midnight while the API was returning 200.
+Local midnight is only a ceiling on a bench, never the default. The full 429
+body and headers are logged at INFO *before* classification, so a
+misclassification can be diagnosed from the log rather than reproduced.
+
+This has been wrong twice, in opposite directions, so it is covered by
+`tests/test_rate_limit.py` against responses captured verbatim from both live
+APIs.
 
 **A dead mark is an optimisation, not a promise.** If every provider in the chain
 is benched, the router makes a second pass and tries them anyway rather than
@@ -218,7 +244,8 @@ Everything tunable lives in `config.yaml`. Model names are never hardcoded, beca
 | `llm.stream` | `true` | Stream completions |
 | `llm.max_tool_iterations` | `4` | Guard against tool-call ping-pong |
 | `llm.rate_limit_retries` | `3` | Per-minute 429 retries |
-| `llm.daily_probe_after_s` | `900` | Re-probe after a daily 429 that carried no retry-after |
+| `llm.transient_recovery_s` | `90` | Recovery within this is retried, not benched |
+| `llm.daily_probe_after_s` | `900` | Bench length when a 429 gives no recovery evidence |
 | `llm.last_resort_retry` | `true` | Try benched providers rather than answer nothing |
 | `llm.history_turns` | `6` | Rolling conversation memory |
 | `stt.model` | `whisper-large-v3-turbo` | Speech to text |
@@ -323,6 +350,7 @@ Run it in a quiet room with nothing else playing, or it measures the room instea
 ## Development
 
 ```bash
+pytest tests/ -q                         # rate-limit classifier, no network
 python scripts/test_tools.py             # 23 command harness, dry-run, prints SCORE
 python scripts/test_tools.py --self-test # checks the scorer itself, no API calls
 python -m azizgpt.main --mem             # memory breakdown

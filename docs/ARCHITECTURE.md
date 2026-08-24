@@ -187,39 +187,85 @@ was healthy, because a stale mark from a burst of 429s was still in force.
 
 ### Classifying a 429
 
-The two kinds are distinguished by the response body and headers. A daily quota
-is indicated by markers in the message (`per day`, `tokens per day`, `TPD`,
-`RPD`, `daily limit`, `quota exceeded`) or by a `retry-after` longer than an
-hour. Everything else is treated as transient.
+The classifier answers one question — **when does this provider work again?** —
+and takes the answer from the response rather than from the wording. Both
+providers demonstrate why the wording cannot be trusted.
 
-Groq's message is explicit enough to classify on:
-
-```
-Rate limit reached for model `openai/gpt-oss-20b` ... on tokens per day (TPD):
-Limit 200000, Used 199715, Requested 936. Please try again in 4m41.232s.
-```
-
-### Dead until when
+Captured from Groq, live:
 
 ```
-retry-after present   ──▶ min(local midnight, now + retry-after)
-retry-after absent    ──▶ min(local midnight, now + llm.daily_probe_after_s)
+retry-after: 32
+x-ratelimit-reset-tokens: 585ms
+
+"... on tokens per day (TPD): Limit 200000, Used 200000, Requested 73.
+ Please try again in 31.535999999s."
 ```
 
-The obvious implementation benches a daily-quota provider until local midnight.
-That is wrong for Groq, whose per-day bucket refills continuously — the message
-above says four minutes, not eleven hours. It was observed live: the harness had
-Groq marked dead until midnight while a direct probe returned 200 with 7923
-tokens remaining.
+Groq calls this a per-day bucket and it recovers in half a minute, because the
+bucket refills continuously. An earlier version matched on `per day` / `TPD` and
+benched the provider until local midnight. That is the bug that removed the only
+working provider for hours at a stretch.
 
-The `daily_probe_after_s` branch matters just as much. A 429 with no
-`retry-after` used to fall back to midnight, which is how a provider was lost
-for an entire evening. Probing again after fifteen minutes costs one wasted
-request and recovers automatically.
+Captured from OpenRouter, live:
 
-Expiry is lazy: `is_dead()` compares against the clock and clears the mark when
-it has passed, so the next request after the window probes naturally rather than
-waiting for a timer.
+```
+x-ratelimit-limit: 50
+x-ratelimit-remaining: 0
+x-ratelimit-reset: 1787616000000        (epoch ms = UTC midnight, 12h out)
+
+{"error":{"message":"Rate limit exceeded: free-models-per-day. Add 10 credits
+ to unlock 1000 free model requests per day",
+ "metadata":{"limit_source":"openrouter_free_tier_daily", ...}}}
+```
+
+This one really is daily — and it sends no `retry-after` at all. A rule of
+"anything without retry-after is transient" would hammer it 20 times a minute
+for twelve hours. Note also that the upsell sentence mentions "per day" on
+*every* free-tier 429, including per-minute ones, so the phrase carries no
+information.
+
+### Evidence, in order of authority
+
+`gather_evidence()` collects facts without interpreting them:
+
+| Source | Provider | Meaning |
+| --- | --- | --- |
+| `retry-after` header | Groq | seconds until retry |
+| `try again in X` in the body | Groq | seconds, same value |
+| `x-ratelimit-reset` | OpenRouter | absolute epoch **milliseconds** |
+| `x-ratelimit-reset-tokens` / `-requests` | Groq | duration strings: `585ms`, `46m4.8s` |
+| `metadata.limit_source` | OpenRouter | diagnostic label, recorded, never decisive |
+
+`recovery_seconds()` returns the first available, and `classify_rate_limit()`
+compares it to `llm.transient_recovery_s`:
+
+```
+recovery is None            ──▶ transient, sleep a default and retry
+recovery <= threshold (90s) ──▶ transient, sleep that long and retry
+recovery >  threshold       ──▶ exhausted, bench until exactly then
+```
+
+The `None` branch is deliberate. Sleeping briefly on a genuine outage wastes one
+retry; benching a healthy provider costs every request until the mark expires,
+and there is no feedback loop that discovers the mistake. The asymmetry decides
+the default.
+
+Local midnight is a ceiling on the bench, not a target. `llm.daily_probe_after_s`
+(15 minutes) bounds a bench when the response gave no recovery evidence at all
+but something else forced one.
+
+The complete body and headers are logged at INFO by `log_rate_limit()` *before*
+any judgement is made, so a misclassification can be read out of the log instead
+of being reproduced.
+
+### Why this is tested rather than checked by hand
+
+`tests/test_rate_limit.py` runs the classifier against `tests/fixtures_429.py`,
+which holds the captured payloads above verbatim. It asserts both directions:
+Groq's "per day" wording with a 32-second recovery must be transient, and
+OpenRouter's daily cap must bench. It also asserts that daily wording alone can
+never bench a fast recovery, and that a reset header alone is enough to bench
+without any wording. The tests make no network calls and run in CI.
 
 ### Failure reporting
 
