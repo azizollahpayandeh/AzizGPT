@@ -132,7 +132,7 @@ state:
 # it keeps listening for a follow-up, and the model sees the earlier turns so
 # "and what about tomorrow" resolves. Silence closes the session.
 session:
-  follow_up_timeout_s: 5       # quiet for this long after it speaks -> close
+  follow_up_timeout_s: 2       # quiet for this long after it speaks -> close
   max_turns: 12                # hard cap on exchanges in one session
   max_duration_s: 180          # hard cap on how long a session may stay open
 
@@ -144,7 +144,21 @@ recorder:
   min_speech_ms: 300           # ignore a cough or a door
   start_timeout_s: 6           # give up if nobody speaks
   max_seconds: 20              # hard cap on one clip
-  pre_roll_ms: 300             # keep audio from just before speech started
+  pre_roll_ms: 900             # keep audio from just before speech started. Must
+                               # exceed prime_discard_ms + floor_probe_ms, or a
+                               # sentence begun during the probe loses its first
+                               # words.
   speech_over_floor: 3.0       # speech must be this much louder than the room
   min_floor_margin: 50.0       # ...and at least this far above it in absolute
                                # terms, so a silent room cannot pass
+  min_floor_samples: 5         # VAD-silent frames needed before trusting their
+                               # median at all
+  prime_discard_ms: 300        # drop the near-zero frames a stream emits while
+                               # it primes; they are the device, not the room
+  floor_probe_ms: 400          # listen to the room this long before arming the
+                               # VAD, so onset is judged against a real floor
+  onset_grace_ms: 700          # a trigger has this long to prove it is a voice
+  floor_percentile: 20.0       # the floor is the higher of that median and this
+                               # percentile of every frame heard, so neither
+                               # steady room noise nor the near-zero frames a
+                               # stream emits while priming can fake a low floor

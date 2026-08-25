@@ -268,6 +268,14 @@ def log_startup_identity(cfg) -> None:
     )
     log.info("provider chain as loaded: %s", chain)
 
+    session = cfg.get("session", {}) or {}
+    log.info(
+        "session settings as loaded: follow-up window %ss, max %s turns, max %ss",
+        session.get("follow_up_timeout_s", 5),
+        session.get("max_turns", 12),
+        session.get("max_duration_s", 180),
+    )
+
 
 
 def make_gate(cfg) -> PlaybackGate:
@@ -377,9 +385,20 @@ def run_session(
             turn_started = time.monotonic()
             # The first turn gets the configured start timeout; a follow-up gets
             # the shorter session window.
+            if not first:
+                log.info("follow-up window open, %.1fs to speak", follow_up)
+            window_opened = time.monotonic()
             clip = recorder.record(start_timeout_s=None if first else follow_up)
+            waited = time.monotonic() - window_opened
             if clip is None:
+                if not first:
+                    log.info(
+                        "follow-up window closed after %.2fs measured (configured %.1fs)",
+                        waited, follow_up,
+                    )
                 return "you stopped speaking" if first else "silence"
+            if not first:
+                log.info("follow-up picked up speech %.2fs into the window", waited)
 
             stt_started = time.monotonic()
             text, backend = transcriber.transcribe(clip)

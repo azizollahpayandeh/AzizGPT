@@ -80,8 +80,10 @@ def test_evidence_reads_openrouter_metadata():
     assert evidence.limit == "50"
     assert evidence.remaining == "0"
     assert evidence.reset_at is not None
-    # epoch ms 1787616000000 is UTC midnight on 2026-08-25
-    assert evidence.reset_at.astimezone(UTC) == datetime(2026, 8, 25, tzinfo=UTC)
+    # The captured reset was UTC midnight, roughly twelve hours out. Assert the
+    # distance rather than the instant, so this does not expire.
+    hours_out = (evidence.reset_at - datetime.now(UTC)).total_seconds() / 3600
+    assert 11 < hours_out < 13
 
 
 def test_evidence_reads_groq_retry_after():

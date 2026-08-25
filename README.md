@@ -99,7 +99,29 @@ returns to waiting for the wake word.
 
 The window opens only once playback has actually finished, not when the answer
 was generated — otherwise the microphone reopens while the speakers are still
-going and the assistant hears itself. The playback gate applies throughout.
+going and the assistant hears itself. The playback gate applies throughout, so
+the wall-clock cost of a window is `wakeword.post_playback_mute` plus the window
+itself.
+
+The window is a deadline on **speech onset**, not on the turn: a voice that
+starts at 1.9 seconds is never cut off mid-sentence. Getting that to actually
+hold took three fixes, because a false trigger on room noise used to consume the
+window entirely — measured at 8–12 seconds against a configured 2. The recorder
+now spends `recorder.prime_discard_ms` ignoring the near-zero frames a stream
+emits while it opens, then `recorder.floor_probe_ms` measuring the room before it
+will accept an onset, and treats an onset as provisional until enough frames
+clear the threshold. `recorder.pre_roll_ms` must exceed those two combined, or a
+sentence begun immediately loses its opening words; a test enforces that.
+
+Measured on a real microphone with real playback, nobody speaking:
+
+| Configured | Measured to close |
+| --- | --- |
+| 2 s | 3.43 s |
+| 6 s | 7.39 s |
+
+Each is the gate mute (1.0 s) plus the window plus the ~0.4 s room probe, and
+the 3.96 s spread matches the 4 s configured spread.
 
 History belongs to the session and is dropped when it closes, so a new wake word
 always starts clean. Sessions are capped by `session.max_turns` and

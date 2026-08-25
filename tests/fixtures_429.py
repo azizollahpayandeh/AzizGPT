@@ -7,11 +7,20 @@ what the providers actually send, not against what we assume they send.
 # ---------------------------------------------------------------- OpenRouter --
 # Captured by bursting the free tier. This is a genuine daily cap: the headers
 # carry limit/remaining and a reset timestamp 12 hours out (UTC midnight).
+#
+# The captured reset was epoch ms 1787616000000 (2026-08-25 00:00 UTC). Pinning
+# that literal made the test pass only on the day it was recorded and classify
+# as transient forever after, so the value is regenerated relative to now. The
+# shape is exactly as captured; only the instant moves.
+def _twelve_hours_out_ms() -> str:
+    from datetime import UTC, datetime, timedelta
+
+    return str(int((datetime.now(UTC) + timedelta(hours=12)).timestamp() * 1000))
 OPENROUTER_DAILY = {
     "headers": {
         "x-ratelimit-limit": "50",
         "x-ratelimit-remaining": "0",
-        "x-ratelimit-reset": "1787616000000",   # epoch ms, UTC midnight
+        "x-ratelimit-reset": _twelve_hours_out_ms(),   # epoch ms, as captured
     },
     "body": {
         "error": {
@@ -22,7 +31,7 @@ OPENROUTER_DAILY = {
                 "headers": {
                     "X-RateLimit-Limit": "50",
                     "X-RateLimit-Remaining": "0",
-                    "X-RateLimit-Reset": "1787616000000",
+                    "X-RateLimit-Reset": _twelve_hours_out_ms(),
                 },
                 "limit_source": "openrouter_free_tier_daily",
                 "remedy_hint": "Wait for the daily reset (see X-RateLimit-Reset), "
